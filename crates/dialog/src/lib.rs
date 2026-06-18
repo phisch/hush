@@ -1,6 +1,9 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use iced::widget::canvas::path::Arc as PathArc;
 use iced::widget::canvas::{Action, Frame, Geometry, Path, Program, Stroke};
@@ -16,8 +19,6 @@ use iced_layershell::build_pattern::application;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
-
-use pinentry::{ConfirmOutcome, Frontend, PinOutcome, Settings as ProtoSettings};
 
 const BACKDROP: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.8);
 const CARD_BG: Color = Color::from_rgb(0.125, 0.125, 0.133);
@@ -42,16 +43,22 @@ const DANGER: Color = Color::from_rgb(0.92, 0.46, 0.47);
 const MONO: Font = Font::MONOSPACE;
 const FADE_IN: f32 = 0.18;
 
+/// Hard cap on how long the dialog may hold the exclusive keyboard grab.
+///
+/// A supervising parent (e.g. the keyring daemon) should set its own kill
+/// timeout *longer* than this, so the dialog always self-terminates first.
+pub const MAX_LIFETIME: Duration = Duration::from_secs(120);
+
 static PIN_ID: LazyLock<iced::widget::Id> = LazyLock::new(|| iced::widget::Id::new("pin"));
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DialogKind {
     Pin,
     Confirm { one_button: bool },
     Message,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogConfig {
     pub kind: DialogKind,
     pub heading: String,
@@ -66,8 +73,8 @@ pub struct DialogConfig {
     pub quality_bar: bool,
 }
 
-enum DialogResult {
-    Pin(String),
+pub enum DialogResult {
+    Pin(Zeroizing<String>),
     Confirmed,
     Declined,
     Cancelled,
@@ -82,13 +89,15 @@ enum Message {
     Confirm,
     Decline,
     Cancel,
+    FocusNext,
+    FocusPrevious,
     Tick,
 }
 
 struct State {
     config: DialogConfig,
-    pin: String,
-    repeat: String,
+    pin: Zeroizing<String>,
+    repeat: Zeroizing<String>,
     reveal: bool,
     mismatch: bool,
     done: bool,
@@ -105,15 +114,15 @@ impl State {
     }
 }
 
-fn run_dialog(config: DialogConfig) -> DialogResult {
+pub fn run_dialog(config: DialogConfig) -> DialogResult {
     let result = Arc::new(Mutex::new(DialogResult::Cancelled));
 
     let boot_result = result.clone();
     let boot = move || {
         let state = State {
             config: config.clone(),
-            pin: String::new(),
-            repeat: String::new(),
+            pin: Zeroizing::new(String::new()),
+            repeat: Zeroizing::new(String::new()),
             reveal: false,
             mismatch: false,
             done: false,
@@ -123,6 +132,15 @@ fn run_dialog(config: DialogConfig) -> DialogResult {
         };
         (state, iced::widget::operation::focus(PIN_ID.clone()))
     };
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(MAX_LIFETIME)
+        {
+            eprintln!("hush: dialog timed out; releasing keyboard grab");
+            std::process::exit(2);
+        }
+    });
 
     let _ = application(boot, namespace, update, view)
         .style(style)
@@ -139,6 +157,8 @@ fn run_dialog(config: DialogConfig) -> DialogResult {
             ..Default::default()
         })
         .run();
+
+    let _ = done_tx.send(());
 
     let mut slot = result.lock().unwrap();
     std::mem::replace(&mut slot, DialogResult::Cancelled)
@@ -168,6 +188,15 @@ fn handle_event(
             key: Key::Named(Named::Enter),
             ..
         }) => Some(Message::Confirm),
+        iced::Event::Keyboard(KeyPressed {
+            key: Key::Named(Named::Tab),
+            modifiers,
+            ..
+        }) => Some(if modifiers.shift() {
+            Message::FocusPrevious
+        } else {
+            Message::FocusNext
+        }),
         _ => None,
     }
 }
@@ -178,12 +207,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     }
     match message {
         Message::PinChanged(value) => {
-            state.pin = value;
+            state.pin = Zeroizing::new(value);
             state.mismatch = false;
             Task::none()
         }
         Message::RepeatChanged(value) => {
-            state.repeat = value;
+            state.repeat = Zeroizing::new(value);
             state.mismatch = false;
             Task::none()
         }
@@ -193,11 +222,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Confirm => match state.config.kind {
             DialogKind::Pin => {
-                if state.config.repeat_label.is_some() && state.pin != state.repeat {
+                if state.config.repeat_label.is_some() && *state.pin != *state.repeat {
                     state.mismatch = true;
                     Task::none()
                 } else {
-                    let pin = std::mem::take(&mut state.pin);
+                    let pin = std::mem::replace(&mut state.pin, Zeroizing::new(String::new()));
                     state.finish(DialogResult::Pin(pin))
                 }
             }
@@ -207,6 +236,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         },
         Message::Decline => state.finish(DialogResult::Declined),
         Message::Cancel => state.finish(DialogResult::Cancelled),
+        Message::FocusNext => iced::widget::operation::focus_next(),
+        Message::FocusPrevious => iced::widget::operation::focus_previous(),
         Message::Tick => {
             let started = *state.started.get_or_insert_with(Instant::now);
             let t = (started.elapsed().as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
@@ -649,86 +680,4 @@ fn strength(pin: &str) -> f32 {
     let length_score = (len as f32 / 16.0).min(1.0);
     let variety_score = classes as f32 / 4.0;
     (0.6 * length_score + 0.4 * variety_score).min(1.0)
-}
-
-pub struct LayerShell;
-
-impl LayerShell {
-    fn config(settings: &ProtoSettings, kind: DialogKind) -> DialogConfig {
-        let default_heading = match kind {
-            DialogKind::Pin => "Unlock your key",
-            DialogKind::Confirm { .. } => "Please confirm",
-            DialogKind::Message => "Notice",
-        };
-
-        DialogConfig {
-            heading: non_empty(settings.title.clone())
-                .map(|t| strip_accel(&t))
-                .unwrap_or_else(|| default_heading.to_string()),
-            description: non_empty(settings.description.clone()),
-            error: non_empty(settings.error.clone()),
-            placeholder: non_empty(settings.prompt.clone())
-                .or_else(|| non_empty(settings.default_prompt.clone()))
-                .map(|p| strip_accel(p.trim_end_matches(':')))
-                .unwrap_or_else(|| "Enter PIN".to_string()),
-            ok_label: clean_label(
-                settings
-                    .ok_label
-                    .clone()
-                    .or_else(|| settings.default_ok.clone()),
-                match kind {
-                    DialogKind::Pin => "Unlock",
-                    _ => "OK",
-                },
-            ),
-            cancel_label: clean_label(
-                settings
-                    .cancel_label
-                    .clone()
-                    .or_else(|| settings.default_cancel.clone()),
-                "Cancel",
-            ),
-            not_ok_label: non_empty(settings.not_ok_label.clone()).map(|l| strip_accel(&l)),
-            repeat_label: settings.repeat.clone().map(|l| strip_accel(&l)),
-            repeat_error: settings.repeat_error.clone().unwrap_or_default(),
-            quality_bar: settings.quality_bar.is_some(),
-            kind,
-        }
-    }
-}
-
-impl Frontend for LayerShell {
-    fn get_pin(&mut self, settings: &ProtoSettings) -> PinOutcome {
-        match run_dialog(Self::config(settings, DialogKind::Pin)) {
-            DialogResult::Pin(pin) => PinOutcome::Entered(pin),
-            _ => PinOutcome::Cancelled,
-        }
-    }
-
-    fn confirm(&mut self, settings: &ProtoSettings, one_button: bool) -> ConfirmOutcome {
-        match run_dialog(Self::config(settings, DialogKind::Confirm { one_button })) {
-            DialogResult::Confirmed => ConfirmOutcome::Yes,
-            DialogResult::Declined => ConfirmOutcome::No,
-            _ => ConfirmOutcome::Cancelled,
-        }
-    }
-
-    fn message(&mut self, settings: &ProtoSettings) {
-        let _ = run_dialog(Self::config(settings, DialogKind::Message));
-    }
-}
-
-fn non_empty(value: Option<String>) -> Option<String> {
-    value.filter(|s| !s.trim().is_empty())
-}
-
-fn clean_label(label: Option<String>, default: &str) -> String {
-    match non_empty(label) {
-        Some(label) => strip_accel(&label),
-        None => default.to_string(),
-    }
-}
-
-fn strip_accel(label: &str) -> String {
-    label.replace('_', "")
 }
