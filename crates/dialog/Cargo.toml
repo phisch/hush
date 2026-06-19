@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # wgpu renders translucency correctly; tiny-skia is the software fallback and needs "wayland" for softbuffer.
-iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "thread-pool", "wayland", "canvas"] }
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "thread-pool", "wayland", "canvas", "svg"] }
 iced_layershell = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
 zeroize = "1"

@@ -1,44 +1,48 @@
-use std::f32::consts::{PI, TAU};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use iced::widget::canvas::path::Arc as PathArc;
-use iced::widget::canvas::{Action, Frame, Geometry, Path, Program, Stroke};
+use iced::widget::canvas::{Action, Geometry, Program};
 use iced::widget::Column;
 use iced::widget::{
-    button, canvas as canvas_widget, checkbox, column, container, progress_bar, row, text,
-    text_input, Space,
+    button, canvas as canvas_widget, checkbox, column, container, mouse_area, progress_bar, row,
+    stack, svg, text, text_input, Space,
 };
-use iced::{
-    Background, Border, Color, Element, Font, Length, Point, Radians, Shadow, Size, Task, Theme,
-    Vector,
-};
+use iced::{Background, Border, Color, Element, Font, Length, Shadow, Task, Theme, Vector};
 use iced_layershell::build_pattern::application;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 
+const fn hex(r: u8, g: u8, b: u8) -> Color {
+    Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+}
+
 const BACKDROP: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.8);
-const CARD_BG: Color = Color::from_rgb(0.125, 0.125, 0.133);
-const CARD_BORDER: Color = Color::from_rgb(0.21, 0.21, 0.223);
-const FIELD_BG: Color = Color::from_rgb(0.082, 0.082, 0.090);
-const FIELD_BORDER: Color = Color::from_rgb(0.21, 0.21, 0.223);
-const FIELD_BORDER_FOCUS: Color = Color::from_rgba(0.36, 0.56, 0.96, 0.55);
+const CARD_BG: Color = Color::from_rgb(0.07, 0.07, 0.07);
+const CARD_BORDER: Color = Color::from_rgb(0.13, 0.13, 0.13);
+const FIELD_BG: Color = hex(0x0F, 0x0F, 0x0F);
+const FIELD_BG_FOCUS: Color = hex(0x1D, 0x1D, 0x1D);
+const FIELD_BORDER: Color = hex(0x27, 0x27, 0x27);
 const TITLE: Color = Color::from_rgb(0.94, 0.94, 0.95);
 const DESC: Color = Color::from_rgb(0.62, 0.63, 0.67);
 const LABEL: Color = Color::from_rgb(0.45, 0.46, 0.50);
 const PLACEHOLDER: Color = Color::from_rgb(0.42, 0.43, 0.47);
 const SHOW: Color = Color::from_rgb(0.60, 0.61, 0.66);
-const CANCEL_FG: Color = Color::from_rgb(0.76, 0.77, 0.80);
+const STRENGTH_TRACK: Color = hex(0x22, 0x22, 0x22);
+const STRENGTH_WEAK: Color = hex(0xE5, 0x48, 0x4D);
+const STRENGTH_MEDIUM: Color = hex(0xE6, 0xB3, 0x40);
+const STRENGTH_STRONG: Color = hex(0x5C, 0xC8, 0x6B);
+const CANCEL_FG: Color = hex(0x8F, 0x8F, 0x8F);
+const CANCEL_HOVER_BG: Color = hex(0x1F, 0x1F, 0x1F);
 const PILL_FG: Color = Color::from_rgb(0.84, 0.89, 1.0);
-const HINT_DIM: Color = Color::from_rgb(0.40, 0.41, 0.45);
-const HINT_KEY: Color = Color::from_rgb(0.58, 0.59, 0.64);
+const HINT_DIM: Color = hex(0x39, 0x39, 0x39);
+const HINT_KEY: Color = hex(0xA5, 0xA5, 0xA5);
 const LOCK: Color = Color::from_rgb(0.74, 0.81, 0.98);
-const ICON_BG: Color = Color::from_rgba(0.36, 0.56, 0.96, 0.10);
-const ACCENT: Color = Color::from_rgb(0.36, 0.56, 0.96);
+const ICON_BG: Color = Color::from_rgba(0.35, 0.0, 1.0, 0.4);
+const ACCENT: Color = Color::from_rgba(0.35, 0.0, 0.1, 0.4);
 const DANGER: Color = Color::from_rgb(0.92, 0.46, 0.47);
 
 const MONO: Font = Font::MONOSPACE;
@@ -51,6 +55,18 @@ const FADE_IN: f32 = 0.18;
 pub const MAX_LIFETIME: Duration = Duration::from_secs(120);
 
 static PIN_ID: LazyLock<iced::widget::Id> = LazyLock::new(|| iced::widget::Id::new("pin"));
+
+const LOCK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" height="40px" viewBox="0 -960 960 960" width="40px" fill="#e3e3e3"><path d="M226.67-80q-27.5 0-47.09-19.58Q160-119.17 160-146.67v-422.66q0-27.5 19.58-47.09Q199.17-636 226.67-636h60v-90.67q0-80.23 56.57-136.78T480.07-920q80.26 0 136.76 56.55 56.5 56.55 56.5 136.78V-636h60q27.5 0 47.09 19.58Q800-596.83 800-569.33v422.66q0 27.5-19.58 47.09Q760.83-80 733.33-80H226.67Zm0-66.67h506.66v-422.66H226.67v422.66Zm308.5-155.85Q558-325.04 558-356.67q0-31-22.95-55.16Q512.11-436 479.89-436t-55.06 24.17Q402-387.67 402-356.33q0 31.33 22.95 53.83 22.94 22.5 55.16 22.5t55.06-22.52ZM353.33-636h253.34v-90.67q0-52.77-36.92-89.72-36.93-36.94-89.67-36.94-52.75 0-89.75 36.94-37 36.95-37 89.72V-636ZM226.67-146.67v-422.66 422.66Z"/></svg>"##;
+
+static LOCK_ICON: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(LOCK_SVG));
+
+const EYE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3"><path d="M599-361q49-49 49-119t-49-119q-49-49-119-49t-119 49q-49 49-49 119t49 119q49 49 119 49t119-49Zm-187-51q-28-28-28-68t28-68q28-28 68-28t68 28q28 28 28 68t-28 68q-28 28-68 28t-68-28ZM220-270.5Q103-349 48-480q55-131 172-209.5T480-768q143 0 260 78.5T912-480q-55 131-172 209.5T480-192q-143 0-260-78.5ZM480-480Zm207 158q95-58 146-158-51-100-146-158t-207-58q-112 0-207 58T127-480q51 100 146 158t207 58q112 0 207-58Z"/></svg>"##;
+
+const EYE_OFF_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3"><path d="m637-425-62-62q4-38-23-65.5T487-576l-62-62q13-5 27-7.5t28-2.5q70 0 119 49t49 119q0 14-2.5 28t-8.5 27Zm133 133-52-52q36-28 65.5-61.5T833-480q-49-101-144.5-158.5T480-696q-26 0-51 3t-49 10l-58-58q38-15 77.5-21t80.5-6q143 0 261.5 77.5T912-480q-22 57-58.5 103.5T770-292Zm-2 202L638-220q-38 14-77.5 21t-80.5 7q-143 0-261.5-77.5T48-480q22-57 58-104t84-85L90-769l51-51 678 679-51 51ZM241-617q-35 28-65 61.5T127-480q49 101 144.5 158.5T480-264q26 0 51-3.5t50-9.5l-45-45q-14 5-28 7.5t-28 2.5q-70 0-119-49t-49-119q0-14 3.5-28t6.5-28l-81-81Zm287 89Zm-96 96Z"/></svg>"##;
+
+static EYE_ICON: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(EYE_SVG));
+static EYE_OFF_ICON: LazyLock<svg::Handle> =
+    LazyLock::new(|| svg::Handle::from_memory(EYE_OFF_SVG));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DialogKind {
@@ -96,7 +112,7 @@ pub enum DialogResult {
 enum Message {
     PinChanged(String),
     RepeatChanged(String),
-    ToggleReveal,
+    Reveal(bool),
     ToggleChoice(bool),
     Confirm,
     Decline,
@@ -230,8 +246,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.mismatch = false;
             Task::none()
         }
-        Message::ToggleReveal => {
-            state.reveal = !state.reveal;
+        Message::Reveal(reveal) => {
+            state.reveal = reveal;
             Task::none()
         }
         Message::Confirm => match state.config.kind {
@@ -242,7 +258,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 } else {
                     let pin = std::mem::replace(&mut state.pin, Zeroizing::new(String::new()));
                     let choice = state.choice;
-                    state.finish(DialogResult::Pin { secret: pin, choice })
+                    state.finish(DialogResult::Pin {
+                        secret: pin,
+                        choice,
+                    })
                 }
             }
             DialogKind::Confirm { .. } | DialogKind::Message => {
@@ -319,31 +338,46 @@ fn choice_row(label: &str, checked: bool) -> Element<'_, Message> {
                     | checkbox::Status::Disabled { is_checked: true }
             );
             checkbox::Style {
-                background: Background::Color(if is_checked { ACCENT } else { FIELD_BG }),
+                background: Background::Color(FIELD_BG),
                 icon_color: Color::from_rgb(1.0, 1.0, 1.0),
                 border: Border {
                     color: FIELD_BORDER,
                     width: 1.0,
-                    radius: 5.0.into(),
+                    radius: 4.0.into(),
                 },
-                text_color: Some(DESC),
+                text_color: Some(if is_checked {
+                    DESC
+                } else {
+                    DESC.scale_alpha(0.4)
+                }),
             }
         })
         .into()
 }
 
 fn header(config: &DialogConfig, animating: bool) -> Element<'_, Message> {
-    let icon = container(
-        canvas_widget(LockIcon { animating })
-            .width(Length::Fixed(38.0))
-            .height(Length::Fixed(38.0)),
+    let ticker = canvas_widget(Ticker { animating })
+        .width(Length::Fixed(42.0))
+        .height(Length::Fixed(42.0));
+    let glyph = container(
+        svg(LOCK_ICON.clone())
+            .width(Length::Fixed(22.0))
+            .height(Length::Fixed(22.0))
+            .style(|_theme, _status| svg::Style { color: Some(LOCK) }),
     )
-    .style(icon_style);
+    .center(Length::Fixed(42.0));
+    let icon = container(stack![ticker, glyph]).style(icon_style);
 
-    row![icon, text(config.heading.clone()).size(17).color(TITLE)]
-        .spacing(14)
-        .align_y(iced::Alignment::Center)
-        .into()
+    row![
+        icon,
+        text(config.heading.clone())
+            .size(24)
+            .font(Font::with_name("Inter"))
+            .color(TITLE)
+    ]
+    .spacing(14)
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 fn info_block(config: &DialogConfig) -> Option<Element<'_, Message>> {
@@ -394,14 +428,16 @@ fn pin_section(state: &State) -> Element<'_, Message> {
     .spacing(12);
 
     if config.quality_bar {
+        let value = strength(&state.pin);
+        let fill = strength_color(value);
         section = section.push(
-            progress_bar(0.0..=1.0, strength(&state.pin))
-                .girth(Length::Fixed(3.0))
-                .style(|_theme| progress_bar::Style {
-                    background: Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.06)),
-                    bar: Background::Color(ACCENT),
+            progress_bar(0.0..=1.0, value)
+                .girth(Length::Fixed(6.0))
+                .style(move |_theme| progress_bar::Style {
+                    background: Background::Color(STRENGTH_TRACK),
+                    bar: Background::Color(fill),
                     border: Border {
-                        radius: 2.0.into(),
+                        radius: 3.0.into(),
                         ..Default::default()
                     },
                 }),
@@ -443,35 +479,57 @@ fn pin_field<'a>(
     on_input: impl Fn(String) -> Message + 'a,
     with_toggle: bool,
 ) -> Element<'a, Message> {
+    // The text_input is the field box (background, border, padding) so its
+    // background can be focus-aware; the Show button floats over its right edge.
+    let padding = iced::Padding {
+        top: 11.0,
+        right: if with_toggle { 64.0 } else { 13.0 },
+        bottom: 11.0,
+        left: 13.0,
+    };
     let mut input = text_input(placeholder, value)
         .secure(!reveal)
         .on_input(on_input)
         .font(MONO)
         .size(15)
-        .padding(0)
+        .padding(padding)
         .width(Length::Fill)
-        .style(borderless_field);
+        .style(field_input);
     if let Some(id) = id {
         input = input.id(id);
     }
 
-    let mut inner = row![input].align_y(iced::Alignment::Center).spacing(10);
-
-    if with_toggle {
-        let label = if reveal { "Hide" } else { "Show" };
-        inner = inner.push(
-            button(text(label).size(13))
-                .on_press(Message::ToggleReveal)
-                .padding(0)
-                .style(toggle_button),
-        );
+    if !with_toggle {
+        return input.into();
     }
 
-    container(inner)
-        .padding([11, 13])
+    let icon = if reveal {
+        EYE_OFF_ICON.clone()
+    } else {
+        EYE_ICON.clone()
+    };
+    let eye = mouse_area(
+        svg(icon)
+            .width(Length::Fixed(20.0))
+            .height(Length::Fixed(20.0))
+            .style(|_theme, _status| svg::Style { color: Some(SHOW) }),
+    )
+    .on_press(Message::Reveal(true))
+    .on_release(Message::Reveal(false))
+    .on_exit(Message::Reveal(false));
+    let reveal_control = container(eye)
         .width(Length::Fill)
-        .style(field_style)
-        .into()
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .align_y(iced::alignment::Vertical::Center)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 13.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
+
+    stack![input, reveal_control].into()
 }
 
 fn footer(state: &State) -> Element<'_, Message> {
@@ -549,11 +607,15 @@ fn banner<'a>(message: &str) -> Element<'a, Message> {
         .into()
 }
 
-struct LockIcon {
+/// An invisible canvas whose only job is to republish [`Message::Tick`] on
+/// every redraw while animating — that self-sustaining loop is what drives the
+/// fade-in under `iced_layershell` (a plain timer subscription doesn't keep
+/// firing). It draws nothing; the lock glyph is an SVG layered on top.
+struct Ticker {
     animating: bool,
 }
 
-impl Program<Message> for LockIcon {
+impl Program<Message> for Ticker {
     type State = ();
 
     fn update(
@@ -573,31 +635,12 @@ impl Program<Message> for LockIcon {
     fn draw(
         &self,
         _state: &(),
-        renderer: &iced::Renderer,
+        _renderer: &iced::Renderer,
         _theme: &Theme,
-        bounds: iced::Rectangle,
+        _bounds: iced::Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let stroke = || Stroke::default().with_width(2.0).with_color(LOCK);
-
-        let body =
-            Path::rounded_rectangle(Point::new(10.0, 15.0), Size::new(18.0, 14.0), 4.0.into());
-        frame.stroke(&body, stroke());
-
-        let shackle = Path::new(|builder| {
-            builder.arc(PathArc {
-                center: Point::new(19.0, 15.0),
-                radius: 5.5,
-                start_angle: Radians(PI),
-                end_angle: Radians(TAU),
-            });
-        });
-        frame.stroke(&shackle, stroke());
-
-        frame.fill(&Path::circle(Point::new(19.0, 21.5), 1.4), LOCK);
-
-        vec![frame.into_geometry()]
+        Vec::new()
     }
 }
 
@@ -633,36 +676,24 @@ fn icon_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(ICON_BG)),
         border: Border {
-            radius: 11.0.into(),
+            radius: 8.0.into(),
             ..Default::default()
         },
         ..Default::default()
     }
 }
 
-fn field_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(FIELD_BG)),
+fn field_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let background = match status {
+        text_input::Status::Focused { .. } => FIELD_BG_FOCUS,
+        _ => FIELD_BG,
+    };
+    text_input::Style {
+        background: Background::Color(background),
         border: Border {
             color: FIELD_BORDER,
             width: 1.0,
             radius: 9.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
-fn borderless_field(_theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let border_color = match status {
-        text_input::Status::Focused { .. } => FIELD_BORDER_FOCUS,
-        _ => Color::TRANSPARENT,
-    };
-    text_input::Style {
-        background: Background::Color(Color::TRANSPARENT),
-        border: Border {
-            color: border_color,
-            width: 0.0,
-            radius: 0.0.into(),
         },
         icon: Color::TRANSPARENT,
         placeholder: PLACEHOLDER,
@@ -673,16 +704,14 @@ fn borderless_field(_theme: &Theme, status: text_input::Status) -> text_input::S
 
 fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            Color::from_rgba(0.36, 0.56, 0.96, 0.16)
-        }
-        _ => Color::from_rgba(0.36, 0.56, 0.96, 0.10),
+        button::Status::Hovered | button::Status::Pressed => Color::from_rgba(0.35, 0.0, 1.0, 0.6),
+        _ => Color::from_rgba(0.35, 0.0, 1.0, 0.4),
     };
     button::Style {
         background: Some(Background::Color(bg)),
         text_color: PILL_FG,
         border: Border {
-            radius: 9.0.into(),
+            radius: 6.0.into(),
             ..Default::default()
         },
         ..Default::default()
@@ -690,48 +719,39 @@ fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
 }
 
 fn text_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let fg = match status {
-        button::Status::Hovered | button::Status::Pressed => TITLE,
-        _ => CANCEL_FG,
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Background::Color(CANCEL_HOVER_BG))
+        }
+        _ => None,
     };
     button::Style {
-        background: None,
-        text_color: fg,
-        ..Default::default()
-    }
-}
-
-fn toggle_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let fg = match status {
-        button::Status::Hovered | button::Status::Pressed => TITLE,
-        _ => SHOW,
-    };
-    button::Style {
-        background: None,
-        text_color: fg,
+        background,
+        text_color: CANCEL_FG,
+        border: Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
 
 fn strength(pin: &str) -> f32 {
-    if pin.is_empty() {
-        return 0.0;
+    (pin.chars().count() as f32 / 20.0).clamp(0.0, 1.0)
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    Color::from_rgb(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+    )
+}
+
+fn strength_color(value: f32) -> Color {
+    if value < 0.5 {
+        lerp_color(STRENGTH_WEAK, STRENGTH_MEDIUM, value / 0.5)
+    } else {
+        lerp_color(STRENGTH_MEDIUM, STRENGTH_STRONG, (value - 0.5) / 0.5)
     }
-    let len = pin.chars().count();
-    let mut classes = 0u32;
-    if pin.chars().any(|c| c.is_lowercase()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| c.is_uppercase()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| c.is_numeric()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| !c.is_alphanumeric()) {
-        classes += 1;
-    }
-    let length_score = (len as f32 / 16.0).min(1.0);
-    let variety_score = classes as f32 / 4.0;
-    (0.6 * length_score + 0.4 * variety_score).min(1.0)
 }
