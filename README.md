@@ -61,3 +61,8 @@ Every color, font, size, border, and radius is themeable through a [KDL](https:/
 
 The [`default-theme.kdl`](crates/dialog/src/default-theme.kdl) file lists every available
 option at its default value, copy it to `~/.config/psst/theme.kdl` and edit to taste.
+
+## License
+
+[MPL-2.0](LICENSE). You can use psst in anything, but if you redistribute the
+covered files (modified or not), their source must stay open under the MPL.

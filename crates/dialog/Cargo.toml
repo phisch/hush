@@ -2,6 +2,7 @@
 name = "dialog"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 # wgpu renders translucency correctly; tiny-skia is the software fallback and needs "wayland" for softbuffer.

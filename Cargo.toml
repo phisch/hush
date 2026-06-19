@@ -11,3 +11,4 @@ members = [
 # The single place the version lives; every crate uses `version.workspace =
 # true`. To release: bump this, commit, then tag the matching `vX.Y.Z`.
 version = "0.1.0"
+license = "MPL-2.0"

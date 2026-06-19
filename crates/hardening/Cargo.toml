@@ -2,6 +2,7 @@
 name = "hardening"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 libc = "0.2"

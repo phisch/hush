@@ -2,6 +2,7 @@
 name = "keyring-prompter"
 version.workspace = true
 edition = "2021"
+license.workspace = true
 
 [[bin]]
 name = "psst-keyring-prompter"
