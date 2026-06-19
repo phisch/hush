@@ -9,7 +9,8 @@ use iced::widget::canvas::path::Arc as PathArc;
 use iced::widget::canvas::{Action, Frame, Geometry, Path, Program, Stroke};
 use iced::widget::Column;
 use iced::widget::{
-    button, canvas as canvas_widget, column, container, progress_bar, row, text, text_input, Space,
+    button, canvas as canvas_widget, checkbox, column, container, progress_bar, row, text,
+    text_input, Space,
 };
 use iced::{
     Background, Border, Color, Element, Font, Length, Point, Radians, Shadow, Size, Task, Theme,
@@ -71,11 +72,21 @@ pub struct DialogConfig {
     pub repeat_label: Option<String>,
     pub repeat_error: String,
     pub quality_bar: bool,
+    /// When set, a checkbox with this label is shown (e.g. "Automatically
+    /// unlock this keyring whenever I'm logged in").
+    pub choice_label: Option<String>,
+    /// The checkbox's initial state.
+    pub choice: bool,
 }
 
 pub enum DialogResult {
-    Pin(Zeroizing<String>),
-    Confirmed,
+    Pin {
+        secret: Zeroizing<String>,
+        choice: bool,
+    },
+    Confirmed {
+        choice: bool,
+    },
     Declined,
     Cancelled,
 }
@@ -86,6 +97,7 @@ enum Message {
     PinChanged(String),
     RepeatChanged(String),
     ToggleReveal,
+    ToggleChoice(bool),
     Confirm,
     Decline,
     Cancel,
@@ -99,6 +111,7 @@ struct State {
     pin: Zeroizing<String>,
     repeat: Zeroizing<String>,
     reveal: bool,
+    choice: bool,
     mismatch: bool,
     done: bool,
     started: Option<Instant>,
@@ -124,6 +137,7 @@ pub fn run_dialog(config: DialogConfig) -> DialogResult {
             pin: Zeroizing::new(String::new()),
             repeat: Zeroizing::new(String::new()),
             reveal: false,
+            choice: config.choice,
             mismatch: false,
             done: false,
             started: None,
@@ -227,13 +241,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     Task::none()
                 } else {
                     let pin = std::mem::replace(&mut state.pin, Zeroizing::new(String::new()));
-                    state.finish(DialogResult::Pin(pin))
+                    let choice = state.choice;
+                    state.finish(DialogResult::Pin { secret: pin, choice })
                 }
             }
             DialogKind::Confirm { .. } | DialogKind::Message => {
-                state.finish(DialogResult::Confirmed)
+                let choice = state.choice;
+                state.finish(DialogResult::Confirmed { choice })
             }
         },
+        Message::ToggleChoice(value) => {
+            state.choice = value;
+            Task::none()
+        }
         Message::Decline => state.finish(DialogResult::Declined),
         Message::Cancel => state.finish(DialogResult::Cancelled),
         Message::FocusNext => iced::widget::operation::focus_next(),
@@ -263,6 +283,12 @@ fn view(state: &State) -> Element<'_, Message> {
         card = gap(card, 20.0).push(pin_section(state));
     }
 
+    if let Some(label) = &config.choice_label {
+        if !matches!(config.kind, DialogKind::Message) {
+            card = gap(card, 16.0).push(choice_row(label, state.choice));
+        }
+    }
+
     card = gap(card, 22.0).push(footer(state));
 
     let card = container(card)
@@ -276,6 +302,34 @@ fn view(state: &State) -> Element<'_, Message> {
 
 fn gap(card: Column<'_, Message>, height: f32) -> Column<'_, Message> {
     card.push(Space::new().height(Length::Fixed(height)))
+}
+
+fn choice_row(label: &str, checked: bool) -> Element<'_, Message> {
+    checkbox(checked)
+        .label(label.to_string())
+        .on_toggle(Message::ToggleChoice)
+        .size(16.0)
+        .text_size(13.0)
+        .spacing(10.0)
+        .style(|_theme, status| {
+            let is_checked = matches!(
+                status,
+                checkbox::Status::Active { is_checked: true }
+                    | checkbox::Status::Hovered { is_checked: true }
+                    | checkbox::Status::Disabled { is_checked: true }
+            );
+            checkbox::Style {
+                background: Background::Color(if is_checked { ACCENT } else { FIELD_BG }),
+                icon_color: Color::from_rgb(1.0, 1.0, 1.0),
+                border: Border {
+                    color: FIELD_BORDER,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                },
+                text_color: Some(DESC),
+            }
+        })
+        .into()
 }
 
 fn header(config: &DialogConfig, animating: bool) -> Element<'_, Message> {
