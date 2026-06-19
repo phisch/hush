@@ -40,12 +40,12 @@ fn run_dialog_child() {
 
     let mut out = std::io::stdout().lock();
     match run_dialog(config) {
-        DialogResult::Pin(pin) => {
-            let encoded = Zeroizing::new(BASE64_STANDARD.encode(pin.as_bytes()));
-            let _ = writeln!(out, "pin {}", *encoded);
+        DialogResult::Pin { secret, choice } => {
+            let encoded = Zeroizing::new(BASE64_STANDARD.encode(secret.as_bytes()));
+            let _ = writeln!(out, "pin {} {}", *encoded, choice as u8);
         }
-        DialogResult::Confirmed => {
-            let _ = writeln!(out, "yes");
+        DialogResult::Confirmed { choice } => {
+            let _ = writeln!(out, "yes {}", choice as u8);
         }
         DialogResult::Declined | DialogResult::Cancelled => {
             let _ = writeln!(out, "no");
@@ -98,19 +98,28 @@ fn show(config_json: String, cancel: &Cancel) -> Option<PromptResponse> {
 }
 
 fn parse_response(output: &str) -> PromptResponse {
-    let line = output.trim();
-    if let Some(encoded) = line.strip_prefix("pin ") {
-        let Ok(bytes) = BASE64_STANDARD.decode(encoded.trim()) else {
-            return PromptResponse::Dismissed;
-        };
-        let bytes = Zeroizing::new(bytes);
-        return match std::str::from_utf8(&bytes) {
-            Ok(text) => PromptResponse::Password(Zeroizing::new(text.to_owned())),
-            Err(_) => PromptResponse::Dismissed,
-        };
-    }
-    match line {
-        "yes" => PromptResponse::Confirmed,
+    let mut tokens = output.trim().split(' ');
+    match tokens.next() {
+        Some("pin") => {
+            let Some(encoded) = tokens.next() else {
+                return PromptResponse::Dismissed;
+            };
+            let choice = tokens.next() == Some("1");
+            let Ok(bytes) = BASE64_STANDARD.decode(encoded) else {
+                return PromptResponse::Dismissed;
+            };
+            let bytes = Zeroizing::new(bytes);
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => PromptResponse::Password {
+                    secret: Zeroizing::new(text.to_owned()),
+                    choice,
+                },
+                Err(_) => PromptResponse::Dismissed,
+            }
+        }
+        Some("yes") => PromptResponse::Confirmed {
+            choice: tokens.next() == Some("1"),
+        },
         _ => PromptResponse::Dismissed,
     }
 }
@@ -138,5 +147,7 @@ fn dialog_config(request: &PromptRequest) -> DialogConfig {
         repeat_label: confirm.then(|| "Confirm password".to_string()),
         repeat_error: "Passwords do not match.".to_string(),
         quality_bar: false,
+        choice_label: request.choice_label.clone(),
+        choice: request.choice,
     }
 }

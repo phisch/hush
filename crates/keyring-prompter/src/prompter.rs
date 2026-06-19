@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Semaphore;
 use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -12,21 +13,62 @@ use crate::secret_exchange::SecretExchange;
 const CALLBACK_INTERFACE: &str = "org.gnome.keyring.internal.Prompter.Callback";
 
 type SessionKey = (String, String);
-type ActiveMap = Arc<Mutex<HashMap<SessionKey, Cancel>>>;
+
+pub(crate) struct Shared {
+    sessions: Mutex<HashMap<SessionKey, SecretExchange>>,
+    active: Mutex<HashMap<SessionKey, Cancel>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            sessions: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn cleanup_caller(&self, name: &str) {
+        let keys: Vec<SessionKey> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let keys: Vec<SessionKey> = sessions
+                .keys()
+                .filter(|(sender, _)| sender == name)
+                .cloned()
+                .collect();
+            for key in &keys {
+                sessions.remove(key);
+            }
+            keys
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let mut active = self.active.lock().unwrap();
+        for key in &keys {
+            if let Some(cancel) = active.remove(key) {
+                cancel.trigger();
+            }
+        }
+    }
+}
 
 pub struct Service {
     ui: Arc<dyn Ui>,
-    sessions: Mutex<HashMap<SessionKey, SecretExchange>>,
-    active: ActiveMap,
+    shared: Arc<Shared>,
+    dialog_slot: Arc<Semaphore>,
 }
 
 impl Service {
     pub fn new(ui: Arc<dyn Ui>) -> Self {
         Service {
             ui,
-            sessions: Mutex::new(HashMap::new()),
-            active: Arc::new(Mutex::new(HashMap::new())),
+            shared: Arc::new(Shared::new()),
+            dialog_slot: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 }
 
@@ -38,26 +80,36 @@ impl Service {
         callback: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
-    ) {
+    ) -> zbus::fdo::Result<()> {
         let Some(key) = session_key(&header, &callback) else {
-            return;
+            return Ok(());
         };
         if !authorized(connection, &key.0).await {
             eprintln!(
                 "hush-keyring: refusing prompt from unauthorized caller {}",
                 key.0
             );
-            return;
+            return Ok(());
         }
 
-        let exchange = SecretExchange::generate();
-        let message = exchange.public_message();
-        self.sessions.lock().unwrap().insert(key.clone(), exchange);
+        let message = {
+            let mut sessions = self.shared.sessions.lock().unwrap();
+            if sessions.contains_key(&key) {
+                return Err(zbus::fdo::Error::Failed(
+                    "Already begun prompting for this prompt callback".into(),
+                ));
+            }
+            let exchange = SecretExchange::generate();
+            let message = exchange.public_message();
+            sessions.insert(key.clone(), exchange);
+            message
+        };
 
         let connection = connection.clone();
         tokio::spawn(async move {
             prompt_ready(&connection, &key, "", &message, HashMap::new()).await;
         });
+        Ok(())
     }
 
     #[zbus(name = "PerformPrompt")]
@@ -69,61 +121,99 @@ impl Service {
         exchange: String,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
-    ) {
+    ) -> zbus::fdo::Result<()> {
         let Some(key) = session_key(&header, &callback) else {
-            return;
+            return Ok(());
         };
         if !authorized(connection, &key.0).await {
-            return;
+            return Ok(());
         }
 
-        let Some(session) = self.sessions.lock().unwrap().get(&key).cloned() else {
-            return;
+        let kind = match r#type.as_str() {
+            "password" => PromptKind::Password {
+                confirm: read_bool(&properties, "password-new"),
+            },
+            "confirm" => PromptKind::Confirm,
+            _ => {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "Invalid type argument".into(),
+                ));
+            }
+        };
+
+        let Some(session) = self.shared.sessions.lock().unwrap().get(&key).cloned() else {
+            return Err(zbus::fdo::Error::Failed(
+                "Not begun prompting for this prompt callback".into(),
+            ));
         };
         let Some(transport_key) = session.transport_key(&exchange) else {
-            return;
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Invalid secret exchange received".into(),
+            ));
         };
 
-        let want_password = r#type == "password";
-        let request = build_request(&properties, want_password);
+        let request = build_request(&properties, kind);
+        let has_choice = request.choice_label.is_some();
 
         let cancel = Cancel::default();
-        self.active
-            .lock()
-            .unwrap()
-            .insert(key.clone(), cancel.clone());
+        {
+            let mut active = self.shared.active.lock().unwrap();
+            if active.contains_key(&key) {
+                return Err(zbus::fdo::Error::Failed(
+                    "Already performing a prompt for this prompt callback".into(),
+                ));
+            }
+            active.insert(key.clone(), cancel.clone());
+        }
 
         let ui = self.ui.clone();
-        let active = self.active.clone();
+        let shared = self.shared.clone();
+        let slot = self.dialog_slot.clone();
         let connection = connection.clone();
         let prompt_cancel = cancel.clone();
         tokio::spawn(async move {
+            let Ok(_permit) = slot.acquire().await else {
+                shared.active.lock().unwrap().remove(&key);
+                return;
+            };
+
+            if cancel.is_cancelled() {
+                shared.active.lock().unwrap().remove(&key);
+                return;
+            }
+
             let response = tokio::task::spawn_blocking(move || ui.prompt(request, &prompt_cancel))
                 .await
                 .unwrap_or(PromptResponse::Dismissed);
-            active.lock().unwrap().remove(&key);
+            shared.active.lock().unwrap().remove(&key);
 
             if cancel.is_cancelled() {
                 return;
             }
 
             let (reply, message, properties) = match response {
-                PromptResponse::Password(secret) => {
+                PromptResponse::Password { secret, choice } => {
                     // gnome-keyring shows a "store unencrypted?" confirmation
                     // unless the prompter reports a non-zero password strength.
                     let strength = if secret.is_empty() { 0 } else { 1 };
                     (
                         "yes",
                         session.encrypted_message(&transport_key, secret.as_bytes()),
-                        password_strength(strength),
+                        reply_properties(Some(strength), has_choice.then_some(choice)),
                     )
                 }
-                PromptResponse::Confirmed => ("yes", session.public_message(), HashMap::new()),
+                PromptResponse::Confirmed { choice } => (
+                    "yes",
+                    session.public_message(),
+                    reply_properties(None, has_choice.then_some(choice)),
+                ),
                 PromptResponse::Dismissed => ("no", session.public_message(), HashMap::new()),
             };
 
             prompt_ready(&connection, &key, reply, &message, properties).await;
         });
+
+        Ok(())
     }
 
     #[zbus(name = "StopPrompting")]
@@ -136,9 +226,9 @@ impl Service {
         let Some(key) = session_key(&header, &callback) else {
             return;
         };
-        self.sessions.lock().unwrap().remove(&key);
+        self.shared.sessions.lock().unwrap().remove(&key);
 
-        let Some(cancel) = self.active.lock().unwrap().remove(&key) else {
+        let Some(cancel) = self.shared.active.lock().unwrap().remove(&key) else {
             return;
         };
         cancel.trigger();
@@ -147,6 +237,25 @@ impl Service {
         tokio::spawn(async move {
             prompt_done(&connection, &key).await;
         });
+    }
+}
+
+pub(crate) async fn watch_callers(connection: Connection, shared: Arc<Shared>) {
+    use futures_util::StreamExt;
+
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(&connection).await else {
+        return;
+    };
+    let Ok(mut changes) = dbus.receive_name_owner_changed().await else {
+        return;
+    };
+    while let Some(signal) = changes.next().await {
+        let Ok(args) = signal.args() else {
+            continue;
+        };
+        if args.new_owner().is_none() {
+            shared.cleanup_caller(&args.name().to_string());
+        }
     }
 }
 
@@ -176,43 +285,49 @@ fn session_key(header: &Header<'_>, callback: &OwnedObjectPath) -> Option<Sessio
     Some((sender, callback.as_str().to_string()))
 }
 
-fn build_request(properties: &HashMap<String, OwnedValue>, want_password: bool) -> PromptRequest {
-    let string = |key: &str| {
-        properties
-            .get(key)
-            .and_then(|value| String::try_from(value.clone()).ok())
-            .filter(|value| !value.is_empty())
-    };
-    let flag = |key: &str| {
-        properties
-            .get(key)
-            .and_then(|value| bool::try_from(value.clone()).ok())
-            .unwrap_or(false)
-    };
+fn read_string(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    properties
+        .get(key)
+        .and_then(|value| String::try_from(value.clone()).ok())
+        .filter(|value| !value.is_empty())
+}
 
+fn read_bool(properties: &HashMap<String, OwnedValue>, key: &str) -> bool {
+    properties
+        .get(key)
+        .and_then(|value| bool::try_from(value.clone()).ok())
+        .unwrap_or(false)
+}
+
+fn build_request(properties: &HashMap<String, OwnedValue>, kind: PromptKind) -> PromptRequest {
     PromptRequest {
-        kind: if want_password {
-            PromptKind::Password {
-                confirm: flag("password-new"),
-            }
-        } else {
-            PromptKind::Confirm
-        },
-        title: string("message").or_else(|| string("title")),
-        description: string("description"),
-        warning: string("warning"),
-        continue_label: string("continue-label"),
-        cancel_label: string("cancel-label"),
+        kind,
+        title: read_string(properties, "message").or_else(|| read_string(properties, "title")),
+        description: read_string(properties, "description"),
+        warning: read_string(properties, "warning"),
+        continue_label: read_string(properties, "continue-label"),
+        cancel_label: read_string(properties, "cancel-label"),
+        choice_label: read_string(properties, "choice-label"),
+        choice: read_bool(properties, "choice-chosen"),
     }
 }
 
-fn password_strength(strength: i32) -> HashMap<String, OwnedValue> {
-    // gcr's prompter wire nests each a{sv} value in a second variant: its client
-    // unboxes twice, so a plain `variant(i)` reads back as 0. We must send
-    // `variant(variant(i))` to match.
-    let nested = Value::Value(Box::new(Value::I32(strength)));
-    let value = OwnedValue::try_from(nested).expect("nested variant is valid");
-    HashMap::from([("password-strength".to_string(), value)])
+fn nested(value: Value<'static>) -> OwnedValue {
+    OwnedValue::try_from(Value::Value(Box::new(value))).expect("nested variant is valid")
+}
+
+fn reply_properties(strength: Option<i32>, choice: Option<bool>) -> HashMap<String, OwnedValue> {
+    let mut properties = HashMap::new();
+    if let Some(strength) = strength {
+        properties.insert(
+            "password-strength".to_string(),
+            nested(Value::I32(strength)),
+        );
+    }
+    if let Some(choice) = choice {
+        properties.insert("choice-chosen".to_string(), nested(Value::Bool(choice)));
+    }
+    properties
 }
 
 async fn prompt_ready(
@@ -258,9 +373,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn password_strength_is_a_nested_int32_variant() {
-        let properties = password_strength(1);
-        let value: Value = properties.get("password-strength").unwrap().clone().into();
-        assert_eq!(value, Value::Value(Box::new(Value::I32(1))));
+    fn reply_properties_are_nested_variants() {
+        let properties = reply_properties(Some(1), Some(true));
+
+        let strength: Value = properties.get("password-strength").unwrap().clone().into();
+        assert_eq!(strength, Value::Value(Box::new(Value::I32(1))));
+
+        let choice: Value = properties.get("choice-chosen").unwrap().clone().into();
+        assert_eq!(choice, Value::Value(Box::new(Value::Bool(true))));
+    }
+
+    #[test]
+    fn reply_properties_omits_absent_fields() {
+        let properties = reply_properties(None, None);
+        assert!(properties.is_empty());
     }
 }

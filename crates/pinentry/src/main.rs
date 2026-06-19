@@ -44,6 +44,8 @@ impl LayerShell {
             repeat_label: settings.repeat.clone().map(|l| strip_accel(&l)),
             repeat_error: settings.repeat_error.clone().unwrap_or_default(),
             quality_bar: settings.quality_bar.is_some(),
+            choice_label: None,
+            choice: false,
             kind,
         }
     }
@@ -52,14 +54,14 @@ impl LayerShell {
 impl Frontend for LayerShell {
     fn get_pin(&mut self, settings: &Settings) -> PinOutcome {
         match run_dialog(Self::config(settings, DialogKind::Pin)) {
-            DialogResult::Pin(pin) => PinOutcome::Entered(pin),
+            DialogResult::Pin { secret, .. } => PinOutcome::Entered(secret),
             _ => PinOutcome::Cancelled,
         }
     }
 
     fn confirm(&mut self, settings: &Settings, one_button: bool) -> ConfirmOutcome {
         match run_dialog(Self::config(settings, DialogKind::Confirm { one_button })) {
-            DialogResult::Confirmed => ConfirmOutcome::Yes,
+            DialogResult::Confirmed { .. } => ConfirmOutcome::Yes,
             DialogResult::Declined => ConfirmOutcome::No,
             _ => ConfirmOutcome::Cancelled,
         }

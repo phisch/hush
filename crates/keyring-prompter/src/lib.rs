@@ -19,10 +19,16 @@ pub fn run<P: Prompter>(ui: P) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve(ui: Arc<dyn Prompter>) -> Result<(), Box<dyn std::error::Error>> {
+    let service = prompter::Service::new(ui);
+    let shared = service.shared();
+
     let connection = Builder::session()?
-        .serve_at(OBJECT_PATH, prompter::Service::new(ui))?
+        .serve_at(OBJECT_PATH, service)?
         .build()
         .await?;
+
+    // Tear prompts down if the keyring caller disconnects mid-prompt.
+    tokio::spawn(prompter::watch_callers(connection.clone(), shared));
 
     connection
         .request_name_with_flags(
