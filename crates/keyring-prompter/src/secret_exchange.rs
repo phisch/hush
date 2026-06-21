@@ -11,8 +11,6 @@ use zeroize::Zeroizing;
 
 const SECTION: &str = "[sx-aes-1]";
 
-/// RFC 3526 group 5 (1536-bit MODP) modulus, the generator is 2. Must match
-/// gnome-keyring/gcr's group exactly or the shared secret won't agree.
 const PRIME: U1536 = U1536::from_be_hex(concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
@@ -24,22 +22,17 @@ const PRIME: U1536 = U1536::from_be_hex(concat!(
     "670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
 ));
 
-/// `base^exponent mod PRIME`, using crypto-bigint's constant-time Montgomery
-/// exponentiation (unlike `num-bigint::modpow`, which leaks the exponent).
 fn modpow(base: &U1536, exponent: &U1536) -> U1536 {
     let params = MontyParams::new(Odd::new(PRIME).expect("the DH modulus is odd"));
     MontyForm::new(base, params).pow(exponent).retrieve()
 }
 
-/// Big-endian bytes with leading zeros stripped (minimal big-endian), which is
-/// how gcr/gnutls serializes the public and shared values on the wire.
 fn to_minimal_be(value: &U1536) -> Vec<u8> {
     let bytes = value.to_be_bytes();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
     bytes[start..].to_vec()
 }
 
-/// Load minimal big-endian bytes (as received) into a fixed-width integer.
 fn load(bytes: &[u8]) -> Option<U1536> {
     let width = U1536::BYTES;
     if bytes.len() > width {
@@ -60,8 +53,8 @@ impl SecretExchange {
     pub fn generate() -> Self {
         let mut bytes = Zeroizing::new([0u8; U1536::BYTES]);
         rand::thread_rng().fill_bytes(&mut *bytes);
-        let modulus = NonZero::new(PRIME.wrapping_sub(&U1536::from_u8(3)))
-            .expect("p - 3 is nonzero");
+        let modulus =
+            NonZero::new(PRIME.wrapping_sub(&U1536::from_u8(3))).expect("p - 3 is nonzero");
         let private = (U1536::from_be_slice(&*bytes) % modulus).wrapping_add(&U1536::from_u8(2));
         let public = modpow(&U1536::from_u8(2), &private);
         SecretExchange { private, public }

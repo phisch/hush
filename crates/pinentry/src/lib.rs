@@ -42,7 +42,6 @@ pub struct Settings {
 }
 
 pub enum PinOutcome {
-    /// The entered passphrase, held in a buffer that is wiped on drop.
     Entered(Zeroizing<String>),
     Cancelled,
 }
@@ -210,8 +209,6 @@ where
                     responses.push(Response::Status("PIN_REPEATED".into()));
                 }
                 if !pin.is_empty() {
-                    // The Zeroizing buffer is wiped when `pin` drops at the end
-                    // of this arm; the wire copy below is necessarily plaintext.
                     responses.push(Response::Data(pin.as_str().to_owned()));
                 }
                 responses.push(Response::Ok(None));

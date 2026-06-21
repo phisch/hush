@@ -12,8 +12,6 @@ pub use prompt::{Cancel, PromptKind, PromptRequest, PromptResponse, Prompter};
 const BUS_NAME: &str = "org.gnome.keyring.SystemPrompter";
 const OBJECT_PATH: &str = "/org/gnome/keyring/Prompter";
 
-/// Run the keyring prompter daemon, using `ui` to show prompts. Takes over the
-/// `org.gnome.keyring.SystemPrompter` name on the session bus and blocks.
 pub fn run<P: Prompter>(ui: P) -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(serve(Arc::new(ui)))
 }
@@ -27,7 +25,6 @@ async fn serve(ui: Arc<dyn Prompter>) -> Result<(), Box<dyn std::error::Error>> 
         .build()
         .await?;
 
-    // Tear prompts down if the keyring caller disconnects mid-prompt.
     tokio::spawn(prompter::watch_callers(connection.clone(), shared));
 
     connection

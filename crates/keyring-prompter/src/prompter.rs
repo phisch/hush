@@ -193,8 +193,6 @@ impl Service {
 
             let (reply, message, properties) = match response {
                 PromptResponse::Password { secret, choice } => {
-                    // gnome-keyring shows a "store unencrypted?" confirmation
-                    // unless the prompter reports a non-zero password strength.
                     let strength = if secret.is_empty() { 0 } else { 1 };
                     (
                         "yes",
