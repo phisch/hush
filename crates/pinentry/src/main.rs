@@ -1,7 +1,7 @@
 use std::io::{stdin, stdout};
 
-use dialog::{run_dialog, DialogConfig, DialogKind, DialogResult};
 use pinentry::{ConfirmOutcome, Frontend, PinOutcome, Pinentry, Settings};
+use ui::{run_dialog, DialogConfig, DialogKind, DialogResult};
 
 struct LayerShell;
 
@@ -88,7 +88,6 @@ fn strip_accel(label: &str) -> String {
 }
 
 fn main() {
-    // No core dumps/ptrace: the passphrase lives in this process's memory.
     hardening::forbid_dumps();
 
     let mut pinentry = Pinentry::new(stdin().lock(), stdout().lock(), LayerShell);

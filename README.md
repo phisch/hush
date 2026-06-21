@@ -6,20 +6,20 @@ A not-so-ugly replacement for your pinentry and keyring prompter for wayland usi
   <img src="assets/demo.png" alt="psst asking for a new keyring password" width="520">
 </p>
 
-Psst provides both:
+Psst provides:
 
 - **`psst-pinentry`**: the dialog GnuPG uses to ask for your key passphrase or smartcard PIN (a *pinentry* program for `gpg-agent`).
 - **`psst-keyring-prompter`**: the dialog that unlocks your GNOME keyring, replacing the default gnome keyring prompt.
 
 ## Setup
 
-Build the two programs:
+Build the programs:
 
 ```sh
 cargo build --release
 ```
 
-Both binaries land in `target/release/`.
+All binaries land in `target/release/`.
 
 
 ### GnuPG
@@ -59,7 +59,7 @@ It takes over keyring unlock prompts for as long as it's running.
 
 Every color, font, size, border, and radius is themeable through a [KDL](https://kdl.dev) file at `~/.config/psst/theme.kdl` (or `$XDG_CONFIG_HOME/psst/theme.kdl`). Anything you omit keeps its default, and an invalid theme is ignored with a warning rather than blocking a prompt.
 
-The [`default-theme.kdl`](crates/dialog/src/default-theme.kdl) file lists every available
+The [`default-theme.kdl`](crates/theme/src/default-theme.kdl) file lists every available
 option at its default value, copy it to `~/.config/psst/theme.kdl` and edit to taste.
 
 ## License

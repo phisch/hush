@@ -9,6 +9,6 @@ name = "psst-pinentry"
 path = "src/main.rs"
 
 [dependencies]
-dialog = { path = "../dialog" }
+ui = { path = "../ui" }
 hardening = { path = "../hardening" }
 zeroize = "1"

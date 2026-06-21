@@ -3,15 +3,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::prelude::*;
-use dialog::{run_dialog, DialogConfig, DialogKind, DialogResult};
 use keyring_prompter::{Cancel, PromptKind, PromptRequest, PromptResponse, Prompter};
+use ui::{run_dialog, DialogConfig, DialogKind, DialogResult};
 use zeroize::Zeroizing;
 
 const DIALOG_FLAG: &str = "--dialog";
-/// Backstop for a dialog child that never exits (the keyring client never
-/// calls StopPrompting). Kept longer than the dialog's own `MAX_LIFETIME` so
-/// the child always tears itself down first; this only fires if that failed.
-const CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(dialog::MAX_LIFETIME.as_secs() + 30);
+const CHILD_KILL_TIMEOUT: Duration = Duration::from_secs(ui::MAX_LIFETIME.as_secs() + 30);
 const POLL: Duration = Duration::from_millis(50);
 
 fn main() {
@@ -27,8 +24,6 @@ fn main() {
     }
 }
 
-/// `--dialog` mode: read a `DialogConfig` (JSON) from stdin, show it, and write
-/// a single result line to stdout.
 fn run_dialog_child() {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {

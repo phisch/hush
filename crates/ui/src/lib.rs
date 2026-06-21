@@ -16,16 +16,10 @@ use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 
-mod theme;
-
 use theme::theme;
 
 const FADE_IN: f32 = 0.18;
 
-/// Hard cap on how long the dialog may hold the exclusive keyboard grab.
-///
-/// A supervising parent (e.g. the keyring daemon) should set its own kill
-/// timeout *longer* than this, so the dialog always self-terminates first.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(120);
 
 static PIN_ID: LazyLock<iced::widget::Id> = LazyLock::new(|| iced::widget::Id::new("pin"));
@@ -35,7 +29,7 @@ fn icon_handle(slot: &'static OnceLock<svg::Handle>, markup: &str) -> svg::Handl
         .clone()
 }
 
-fn lock_icon() -> svg::Handle {
+pub(crate) fn lock_icon() -> svg::Handle {
     static SLOT: OnceLock<svg::Handle> = OnceLock::new();
     icon_handle(&SLOT, &theme().title_icon.svg)
 }
@@ -70,10 +64,7 @@ pub struct DialogConfig {
     pub repeat_label: Option<String>,
     pub repeat_error: String,
     pub quality_bar: bool,
-    /// When set, a checkbox with this label is shown (e.g. "Automatically
-    /// unlock this keyring whenever I'm logged in").
     pub choice_label: Option<String>,
-    /// The checkbox's initial state.
     pub choice: bool,
 }
 
@@ -176,7 +167,7 @@ pub fn run_dialog(config: DialogConfig) -> DialogResult {
     std::mem::replace(&mut slot, DialogResult::Cancelled)
 }
 
-fn namespace() -> String {
+pub(crate) fn namespace() -> String {
     String::from("psst")
 }
 
@@ -303,7 +294,7 @@ fn view(state: &State) -> Element<'_, Message> {
     container(card).center(Length::Fill).padding(64).into()
 }
 
-fn edges(padding: theme::Padding) -> iced::Padding {
+pub(crate) fn edges(padding: theme::Padding) -> iced::Padding {
     iced::Padding {
         top: padding.y,
         bottom: padding.y,
@@ -642,10 +633,6 @@ fn banner<'a>(message: &str) -> Element<'a, Message> {
     .into()
 }
 
-/// An invisible canvas whose only job is to republish [`Message::Tick`] on
-/// every redraw while animating — that self-sustaining loop is what drives the
-/// fade-in under `iced_layershell` (a plain timer subscription doesn't keep
-/// firing). It draws nothing; the lock glyph is an SVG layered on top.
 struct Ticker {
     animating: bool,
 }
@@ -690,7 +677,7 @@ fn style(state: &State, _theme: &Theme) -> iced::theme::Style {
     }
 }
 
-fn card_style(_theme: &Theme) -> container::Style {
+pub(crate) fn card_style(_theme: &Theme) -> container::Style {
     let t = &theme().window;
     container::Style {
         text_color: Some(theme().title.color),
@@ -709,7 +696,7 @@ fn card_style(_theme: &Theme) -> container::Style {
     }
 }
 
-fn icon_style(_theme: &Theme) -> container::Style {
+pub(crate) fn icon_style(_theme: &Theme) -> container::Style {
     let t = &theme().title_icon;
     container::Style {
         background: Some(Background::Color(t.background)),
@@ -722,7 +709,7 @@ fn icon_style(_theme: &Theme) -> container::Style {
     }
 }
 
-fn field_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+pub(crate) fn field_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
     let t = match status {
         text_input::Status::Focused { .. } => &theme().field_focus,
         _ => &theme().field.paint,
@@ -741,7 +728,7 @@ fn field_input(_theme: &Theme, status: text_input::Status) -> text_input::Style 
     }
 }
 
-fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
+pub(crate) fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
     let t = match status {
         button::Status::Hovered | button::Status::Pressed => &theme().confirm_hover,
         _ => &theme().confirm.paint,
@@ -749,7 +736,7 @@ fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
     button_style(t)
 }
 
-fn text_button(_theme: &Theme, status: button::Status) -> button::Style {
+pub(crate) fn text_button(_theme: &Theme, status: button::Status) -> button::Style {
     let t = match status {
         button::Status::Hovered | button::Status::Pressed => &theme().cancel_hover,
         _ => &theme().cancel.paint,

@@ -9,7 +9,7 @@ name = "psst-keyring-prompter"
 path = "src/main.rs"
 
 [dependencies]
-dialog = { path = "../dialog" }
+ui = { path = "../ui" }
 hardening = { path = "../hardening" }
 crypto-bigint = "0.6"
 sha2 = "0.10"

@@ -2,11 +2,9 @@
 //
 // Every node is optional, whatever you omit keeps the default shown here.
 //
-// layout { ... } values cannot be changed per interaction state,
-// so they are once per element root.
-//
-// So `:focus`, `:hover`, or `:checked` blocks have exactly the same properties
-// (excluding `layout`) as its element.
+// layout { ... } values cannot be changed per interaction state, so they are
+// once per element root, so `:focus`, `:hover`, or `:checked` blocks have
+// exactly the same properties (excluding `layout`) as its element.
 //
 // Colors are "#rgb" / "#rgba" / "#rrggbb" / "#rrggbbaa".
 // Fonts are a family name `"Inter"` or `"monospace"` / `"default"`.

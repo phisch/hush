@@ -1,0 +1,9 @@
+[package]
+name = "theme"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+iced_core = "0.14"
+kdl = "=6.3.4"   # 6.7+ requires rustc 1.95

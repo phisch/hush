@@ -638,17 +638,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "dialog"
-version = "0.1.0"
-dependencies = [
- "iced",
- "iced_layershell",
- "kdl",
- "serde",
- "zeroize",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1687,7 +1676,6 @@ dependencies = [
  "base64",
  "cbc",
  "crypto-bigint",
- "dialog",
  "futures-util",
  "hardening",
  "hkdf",
@@ -1695,6 +1683,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "ui",
  "zbus",
  "zeroize",
 ]
@@ -2566,8 +2555,8 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 name = "pinentry"
 version = "0.1.0"
 dependencies = [
- "dialog",
  "hardening",
+ "ui",
  "zeroize",
 ]
 
@@ -3350,6 +3339,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "theme"
+version = "0.1.0"
+dependencies = [
+ "iced_core",
+ "kdl",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3544,6 +3541,18 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "iced_layershell",
+ "serde",
+ "serde_json",
+ "theme",
+ "zeroize",
 ]
 
 [[package]]

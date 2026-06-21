@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use iced::{Color, Font};
+use iced_core::{Color, Font};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 const fn rgba(value: u32) -> Color {
