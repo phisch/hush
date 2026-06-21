@@ -1,20 +1,16 @@
 use std::io::{BufRead, Write};
-use std::sync::LazyLock;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 
+use gpui::{div, prelude::*, px, App, Application, Context, Entity, FocusHandle, Window};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::{
-    card_style, edges, field_input, icon_style, lock_icon, namespace, pill_button, text_button,
-    MAX_LIFETIME,
-};
-use iced::widget::{button, column, container, row, svg, text, text_input, Space};
-use iced::{Background, Border, Element, Length, Subscription, Task, Theme};
-use iced_layershell::build_pattern::application;
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
-use iced_layershell::to_layer_message;
+use crate::chrome::{backdrop, banner, button, card, header, hint_line, info_block};
+use crate::fade::Fade;
 use theme::theme;
+use crate::field::Field;
+use crate::{arm_watchdog, layer_window, Cancel, Icons, Submit};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -26,132 +22,178 @@ pub enum Update {
     Done { success: bool },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
     Response { secret: String },
     Cancel,
 }
 
-static FIELD_ID: LazyLock<iced::widget::Id> =
-    LazyLock::new(|| iced::widget::Id::new("psst-conversation-field"));
-
-#[to_layer_message]
-#[derive(Debug, Clone)]
-enum Message {
-    Command(Update),
-    Input(String),
-    Submit,
-    Cancel,
-    Eof,
-}
-
-#[derive(Clone)]
-struct Prompt {
-    echo_on: bool,
-    label: String,
-}
-
-#[derive(Default)]
-struct State {
+struct Convo {
     title: String,
     body: String,
     info: Vec<String>,
     error: Option<String>,
-    prompt: Option<Prompt>,
-    input: Zeroizing<String>,
-    done: bool,
+    prompting: bool,
+    field: Option<Entity<Field>>,
+    pending_focus: bool,
+    focus: FocusHandle,
+    fade: Fade,
 }
 
-pub fn run_conversation() {
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(MAX_LIFETIME)
-        {
-            eprintln!("psst: polkit dialog timed out; releasing keyboard grab");
-            std::process::exit(2);
-        }
-    });
-
-    let _ = application(boot, namespace, update, view)
-        .style(style)
-        .subscription(subscription)
-        .settings(Settings {
-            layer_settings: LayerShellSettings {
-                layer: Layer::Overlay,
-                anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-                exclusive_zone: -1,
-                keyboard_interactivity: KeyboardInteractivity::Exclusive,
-                size: None,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .run();
-
-    let _ = done_tx.send(());
-}
-
-fn boot() -> (State, Task<Message>) {
-    (State::default(), Task::none())
-}
-
-fn update(state: &mut State, message: Message) -> Task<Message> {
-    if state.done {
-        return Task::none();
-    }
-    match message {
-        Message::Command(command) => apply(state, command),
-        Message::Input(value) => {
-            state.input = Zeroizing::new(value);
-            Task::none()
-        }
-        Message::Submit => {
-            if state.prompt.take().is_some() {
-                let secret = std::mem::take(&mut state.input);
-                emit(&Reply::Response {
-                    secret: secret.to_string(),
-                });
-                state.error = None;
+impl Convo {
+    fn new(cx: &mut Context<Self>, rx: Receiver<Option<Update>>) -> Self {
+        cx.spawn(async move |this, cx| loop {
+            match rx.try_recv() {
+                Ok(Some(update)) => {
+                    if this
+                        .update(cx, |convo, cx| convo.apply(update, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = this.update(cx, |convo, cx| convo.finish(cx));
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await
+                }
+                Err(TryRecvError::Disconnected) => break,
             }
-            Task::none()
+        })
+        .detach();
+
+        Self {
+            title: String::new(),
+            body: String::new(),
+            info: Vec::new(),
+            error: None,
+            prompting: false,
+            field: None,
+            pending_focus: false,
+            focus: cx.focus_handle(),
+            fade: Fade::default(),
         }
-        Message::Cancel => {
-            emit(&Reply::Cancel);
-            finish(state)
+    }
+
+    fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
+        match update {
+            Update::Start { title, message } => {
+                self.title = title;
+                self.body = message;
+            }
+            Update::Info { text } => self.info.push(text),
+            Update::Error { text } => self.error = Some(text),
+            Update::Prompt { echo_on, label } => {
+                let field = cx.new(|cx| Field::new(cx, !echo_on, label, px(0.)));
+                self.field = Some(field);
+                self.prompting = true;
+                self.pending_focus = true;
+            }
+            Update::Done { .. } => return self.finish(cx),
         }
-        Message::Eof => finish(state),
-        _ => Task::none(),
+        cx.notify();
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.prompting) {
+            return;
+        }
+        let secret = self
+            .field
+            .as_ref()
+            .map(|field| field.update(cx, |f, _| f.take_value()))
+            .unwrap_or_default();
+        emit(&Reply::Response {
+            secret: secret.to_string(),
+        });
+        self.field = None;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        emit(&Reply::Cancel);
+        self.finish(cx);
+    }
+
+    fn finish(&self, cx: &mut Context<Self>) {
+        cx.quit();
     }
 }
 
-fn apply(state: &mut State, command: Update) -> Task<Message> {
-    match command {
-        Update::Start { title, message } => {
-            state.title = title;
-            state.body = message;
-            Task::none()
+impl Render for Convo {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            if let Some(field) = &self.field {
+                window.focus(&field.read(cx).focus_handle());
+            }
+            self.pending_focus = false;
         }
-        Update::Info { text } => {
-            state.info.push(text);
-            Task::none()
+
+        let opacity = self.fade.opacity(window);
+        let mut body: Vec<gpui::AnyElement> = vec![header(&self.title).into_any_element()];
+
+        if let Some(info) = info_block(
+            self.body
+                .lines()
+                .chain(self.info.iter().map(String::as_str)),
+        ) {
+            body.push(info);
         }
-        Update::Error { text } => {
-            state.error = Some(text);
-            Task::none()
+        if let Some(error) = &self.error {
+            body.push(banner(error).into_any_element());
         }
-        Update::Prompt { echo_on, label } => {
-            state.prompt = Some(Prompt { echo_on, label });
-            state.input = Zeroizing::new(String::new());
-            iced::widget::operation::focus(FIELD_ID.clone())
+        if let Some(field) = &self.field {
+            body.push(field.clone().into_any_element());
         }
-        Update::Done { .. } => finish(state),
+        body.push(self.footer(cx));
+
+        backdrop()
+            .track_focus(&self.focus)
+            .key_context("Convo")
+            .on_action(cx.listener(|this, _: &Submit, _, cx| this.submit(cx)))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
+            .opacity(opacity)
+            .child(card(body))
     }
 }
 
-fn finish(state: &mut State) -> Task<Message> {
-    state.done = true;
-    iced::exit()
+impl Convo {
+    fn footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let prompting = self.prompting;
+        let items: &[(&str, &str)] = if prompting {
+            &[("\u{21B5}", "authenticate"), ("Esc", "cancel")]
+        } else {
+            &[("Esc", "cancel")]
+        };
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.))
+            .w_full()
+            .child(hint_line(items))
+            .child(div().flex_1())
+            .child(
+                button("cancel", "Cancel".to_string(), &theme().cancel)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+            );
+
+        if prompting {
+            row = row.child(
+                button("authenticate", "Authenticate".to_string(), &theme().confirm)
+                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+            );
+        }
+
+        row.into_any_element()
+    }
 }
 
 fn emit(message: &Reply) {
@@ -163,237 +205,58 @@ fn emit(message: &Reply) {
     }
 }
 
-fn view(state: &State) -> Element<'_, Message> {
-    let spacing = theme().window.spacing;
-    let mut card = column![header(&state.title)]
-        .spacing(spacing)
-        .width(Length::Fill);
+pub fn run_conversation() {
+    Application::new()
+        .with_assets(Icons)
+        .run(move |cx: &mut App| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("enter", Submit, Some("Convo")),
+                gpui::KeyBinding::new("escape", Cancel, Some("Convo")),
+            ]);
 
-    if !state.body.is_empty() || !state.info.is_empty() {
-        let mut body = column![].spacing(6);
-        if !state.body.is_empty() {
-            body = body.push(line(&state.body));
-        }
-        for info in &state.info {
-            body = body.push(line(info));
-        }
-        card = card.push(body);
-    }
-
-    if let Some(error) = &state.error {
-        card = card.push(banner(error));
-    }
-    if let Some(prompt) = &state.prompt {
-        card = card.push(field(prompt, &state.input));
-    }
-    card = card.push(footer(state.prompt.is_some()));
-
-    let window = &theme().window;
-    let card = container(card)
-        .padding(edges(window.padding))
-        .max_width(window.width)
-        .width(Length::Fill)
-        .style(card_style);
-
-    container(card).center(Length::Fill).padding(64).into()
-}
-
-fn header(title: &str) -> Element<'_, Message> {
-    let icon = &theme().title_icon;
-    let tile = icon.size + icon.padding * 2.0;
-    let glyph = container(
-        svg(lock_icon())
-            .width(Length::Fixed(icon.size))
-            .height(Length::Fixed(icon.size))
-            .style(|_theme, _status| svg::Style {
-                color: Some(theme().title_icon.color),
-            }),
-    )
-    .center(Length::Fixed(tile));
-
-    row![
-        container(glyph).style(icon_style),
-        text(title.to_string())
-            .size(theme().title.font.size)
-            .font(theme().title.font.family)
-            .color(theme().title.color)
-    ]
-    .spacing(14)
-    .align_y(iced::Alignment::Center)
-    .into()
-}
-
-fn line(value: &str) -> Element<'static, Message> {
-    let style = &theme().description.value;
-    text(value.to_string())
-        .size(style.font.size)
-        .font(style.font.family)
-        .color(style.color)
-        .width(Length::Fill)
-        .into()
-}
-
-fn banner(message: &str) -> Element<'static, Message> {
-    container(
-        text(message.to_string())
-            .size(theme().error.font.size)
-            .color(theme().error.color),
-    )
-    .padding(edges(theme().error.padding))
-    .width(Length::Fill)
-    .style(|_theme| {
-        let error = &theme().error;
-        container::Style {
-            background: Some(Background::Color(error.background)),
-            border: Border {
-                color: error.border.color,
-                width: error.border.size,
-                radius: error.radius.into(),
-            },
-            ..Default::default()
-        }
-    })
-    .into()
-}
-
-fn field<'a>(prompt: &Prompt, input: &'a str) -> Element<'a, Message> {
-    let theme = theme();
-    text_input(&prompt.label, input)
-        .secure(!prompt.echo_on)
-        .on_input(Message::Input)
-        .on_submit(Message::Submit)
-        .id(FIELD_ID.clone())
-        .font(theme.field.font.family)
-        .size(theme.field.font.size)
-        .padding(edges(theme.field.padding))
-        .width(Length::Fill)
-        .style(field_input)
-        .into()
-}
-
-fn footer(prompting: bool) -> Element<'static, Message> {
-    let mut row = row![hints(prompting)]
-        .spacing(10)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill);
-    row = row.push(Space::new().width(Length::Fill));
-    row = row.push(
-        button(text("Cancel").size(theme().cancel.font.size))
-            .on_press(Message::Cancel)
-            .padding(edges(theme().cancel.padding))
-            .style(text_button),
-    );
-    if prompting {
-        row = row.push(
-            button(text("Authenticate").size(theme().confirm.font.size))
-                .on_press(Message::Submit)
-                .padding(edges(theme().confirm.padding))
-                .style(pill_button),
-        );
-    }
-    row.into()
-}
-
-fn hints(prompting: bool) -> Element<'static, Message> {
-    let items: &[(&str, &str)] = if prompting {
-        &[("\u{21B5}", "authenticate"), ("Esc", "cancel")]
-    } else {
-        &[("Esc", "cancel")]
-    };
-
-    let key = &theme().hint.key;
-    let word = &theme().hint.word;
-    let mut line = row![]
-        .spacing(theme().hint.spacing)
-        .align_y(iced::Alignment::Center);
-    for (i, (glyph, label)) in items.iter().enumerate() {
-        if i > 0 {
-            line = line.push(text("\u{00B7}").size(word.font.size).color(word.color));
-        }
-        line = line.push(
-            text(glyph.to_string())
-                .font(key.font.family)
-                .size(key.font.size)
-                .color(key.color),
-        );
-        line = line.push(
-            text(label.to_string())
-                .font(word.font.family)
-                .size(word.font.size)
-                .color(word.color),
-        );
-    }
-    line.into()
-}
-
-fn style(_state: &State, _theme: &Theme) -> iced::theme::Style {
-    iced::theme::Style {
-        background_color: theme().backdrop.color,
-        text_color: theme().title.color,
-    }
-}
-
-fn subscription(_state: &State) -> Subscription<Message> {
-    Subscription::batch([
-        Subscription::run(stdin_worker),
-        iced::event::listen_with(handle_event),
-    ])
-}
-
-fn handle_event(
-    event: iced::Event,
-    _status: iced::event::Status,
-    _id: iced::window::Id,
-) -> Option<Message> {
-    use iced::keyboard::{key::Named, Event::KeyPressed, Key};
-    match event {
-        iced::Event::Keyboard(KeyPressed {
-            key: Key::Named(Named::Escape),
-            ..
-        }) => Some(Message::Cancel),
-        iced::Event::Keyboard(KeyPressed {
-            key: Key::Named(Named::Enter),
-            ..
-        }) => Some(Message::Submit),
-        _ => None,
-    }
-}
-
-fn stdin_worker() -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(
-        16,
-        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            use iced::futures::{SinkExt, StreamExt};
-
-            let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Option<String>>();
+            let (tx, rx) = std::sync::mpsc::channel::<Option<Update>>();
             std::thread::spawn(move || {
                 for line in std::io::stdin().lock().lines() {
-                    match line {
-                        Ok(line) => {
-                            if tx.unbounded_send(Some(line)).is_err() {
-                                break;
-                            }
+                    let Ok(line) = line else { break };
+                    if let Ok(update) = serde_json::from_str::<Update>(line.trim()) {
+                        if tx.send(Some(update)).is_err() {
+                            return;
                         }
-                        Err(_) => break,
                     }
                 }
-                let _ = tx.unbounded_send(None);
+                let _ = tx.send(None);
             });
 
-            while let Some(item) = rx.next().await {
-                let message = match item {
-                    Some(line) => match serde_json::from_str::<Update>(line.trim()) {
-                        Ok(command) => Message::Command(command),
-                        Err(_) => continue,
-                    },
-                    None => Message::Eof,
-                };
-                if output.send(message).await.is_err() {
-                    break;
+            let mut rx = Some(rx);
+            cx.spawn(async move |cx| loop {
+                match rx.as_ref().unwrap().try_recv() {
+                    Ok(Some(first)) => {
+                        let rx = rx.take().unwrap();
+                        let _ = cx.update(|cx| {
+                            arm_watchdog("polkit dialog");
+                            cx.open_window(layer_window(), |window, cx| {
+                                let convo = cx.new(|cx| Convo::new(cx, rx));
+                                convo.update(cx, |convo, cx| convo.apply(first, cx));
+                                window.focus(&convo.read(cx).focus);
+                                convo
+                            })
+                            .unwrap();
+                        });
+                        break;
+                    }
+                    Ok(None) | Err(TryRecvError::Disconnected) => {
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(20))
+                            .await;
+                    }
                 }
-            }
-        },
-    )
+            })
+            .detach();
+        });
 }
 
 #[cfg(test)]

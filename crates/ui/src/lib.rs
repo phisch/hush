@@ -1,52 +1,32 @@
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use gpui::{
+    actions, div, layer_shell::*, prelude::*, px, svg, AnyElement, App, Application, AssetSource,
+    Context, Div, FocusHandle, MouseButton, Result, SharedString, WindowBackgroundAppearance,
+    WindowKind, WindowOptions,
+};
 use serde::{Deserialize, Serialize};
+use theme::theme;
 use zeroize::Zeroizing;
 
-use iced::widget::canvas::{Action, Geometry, Program};
-use iced::widget::Column;
-use iced::widget::{
-    button, canvas as canvas_widget, checkbox, column, container, mouse_area, progress_bar, row,
-    stack, svg, text, text_input, Space,
-};
-use iced::{Background, Border, Color, Element, Length, Shadow, Task, Theme, Vector};
-use iced_layershell::build_pattern::application;
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
-use iced_layershell::to_layer_message;
-
-use theme::theme;
-
+mod chrome;
 mod conversation;
+mod fade;
+mod field;
+mod style;
 
 pub use conversation::{run_conversation, Reply, Update};
 
-const FADE_IN: f32 = 0.18;
+use chrome::{backdrop, banner, button, card, header, hint_line, info_block, strength_bar};
+use fade::Fade;
+use field::{Field, FieldChanged};
+use style::apply;
 
 pub const MAX_LIFETIME: Duration = Duration::from_secs(120);
 
-static PIN_ID: LazyLock<iced::widget::Id> = LazyLock::new(|| iced::widget::Id::new("pin"));
-
-fn icon_handle(slot: &'static OnceLock<svg::Handle>, markup: &str) -> svg::Handle {
-    slot.get_or_init(|| svg::Handle::from_memory(markup.to_string().into_bytes()))
-        .clone()
-}
-
-pub(crate) fn lock_icon() -> svg::Handle {
-    static SLOT: OnceLock<svg::Handle> = OnceLock::new();
-    icon_handle(&SLOT, &theme().title_icon.svg)
-}
-
-fn eye_icon(reveal: bool) -> svg::Handle {
-    static EYE: OnceLock<svg::Handle> = OnceLock::new();
-    static EYE_OFF: OnceLock<svg::Handle> = OnceLock::new();
-    if reveal {
-        icon_handle(&EYE_OFF, &theme().reveal.eye_off)
-    } else {
-        icon_handle(&EYE, &theme().reveal.eye)
-    }
-}
+actions!(psst, [Submit, Cancel, FocusNext, FocusPrevious]);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DialogKind {
@@ -84,700 +64,472 @@ pub enum DialogResult {
     Cancelled,
 }
 
-#[to_layer_message]
-#[derive(Debug, Clone)]
-enum Message {
-    PinChanged(String),
-    RepeatChanged(String),
-    Reveal(bool),
-    ToggleChoice(bool),
-    Confirm,
-    Decline,
-    Cancel,
-    FocusNext,
-    FocusPrevious,
-    Tick,
-}
+struct Icons;
 
-struct State {
-    config: DialogConfig,
-    pin: Zeroizing<String>,
-    repeat: Zeroizing<String>,
-    reveal: bool,
-    choice: bool,
-    mismatch: bool,
-    done: bool,
-    started: Option<Instant>,
-    opacity: f32,
-    result: Arc<Mutex<DialogResult>>,
-}
+impl AssetSource for Icons {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        let svg = match path {
+            "lock.svg" => &theme().icons.lock,
+            "eye.svg" => &theme().icons.eye,
+            "eye-off.svg" => &theme().icons.eye_off,
+            _ => return Ok(None),
+        };
+        Ok(Some(Cow::Owned(svg.clone().into_bytes())))
+    }
 
-impl State {
-    fn finish(&mut self, result: DialogResult) -> Task<Message> {
-        self.done = true;
-        *self.result.lock().unwrap() = result;
-        iced::exit()
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(vec![])
     }
 }
 
-pub fn run_dialog(config: DialogConfig) -> DialogResult {
-    let result = Arc::new(Mutex::new(DialogResult::Cancelled));
+pub(crate) fn layer_window() -> WindowOptions {
+    WindowOptions {
+        titlebar: None,
+        window_background: WindowBackgroundAppearance::Transparent,
+        kind: WindowKind::LayerShell(LayerShellOptions {
+            namespace: "psst".to_string(),
+            layer: Layer::Overlay,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            exclusive_zone: Some(px(-1.)),
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
-    let boot_result = result.clone();
-    let boot = move || {
-        let state = State {
-            config: config.clone(),
-            pin: Zeroizing::new(String::new()),
-            repeat: Zeroizing::new(String::new()),
-            reveal: false,
-            choice: config.choice,
-            mismatch: false,
-            done: false,
-            started: None,
-            opacity: 0.0,
-            result: boot_result.clone(),
-        };
-        (state, iced::widget::operation::focus(PIN_ID.clone()))
-    };
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+pub(crate) fn arm_watchdog(what: &'static str) {
     std::thread::spawn(move || {
-        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(MAX_LIFETIME)
-        {
-            eprintln!("psst: dialog timed out; releasing keyboard grab");
+        std::thread::sleep(MAX_LIFETIME);
+        eprintln!("psst: {what} timed out; releasing keyboard grab");
+        std::process::exit(2);
+    });
+}
+
+fn cancelable_watchdog(what: &'static str) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(MAX_LIFETIME) {
+            eprintln!("psst: {what} timed out; releasing keyboard grab");
             std::process::exit(2);
         }
     });
-
-    let _ = application(boot, namespace, update, view)
-        .style(style)
-        .subscription(subscription)
-        .settings(Settings {
-            layer_settings: LayerShellSettings {
-                layer: Layer::Overlay,
-                anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-                exclusive_zone: -1,
-                keyboard_interactivity: KeyboardInteractivity::Exclusive,
-                size: None,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .run();
-
-    let _ = done_tx.send(());
-
-    let mut slot = result.lock().unwrap();
-    std::mem::replace(&mut slot, DialogResult::Cancelled)
+    tx
 }
 
-pub(crate) fn namespace() -> String {
-    String::from("psst")
+struct Dialog {
+    config: DialogConfig,
+    pin: Option<gpui::Entity<Field>>,
+    repeat: Option<gpui::Entity<Field>>,
+    focus: FocusHandle,
+    reveal: bool,
+    choice: bool,
+    mismatch: bool,
+    fade: Fade,
+    result: Arc<Mutex<DialogResult>>,
 }
 
-fn subscription(_state: &State) -> iced::Subscription<Message> {
-    iced::event::listen_with(handle_event)
+fn subscribe_field(cx: &mut Context<Dialog>, field: &gpui::Entity<Field>) {
+    cx.subscribe(field, |dialog, _, _: &FieldChanged, cx| {
+        dialog.mismatch = false;
+        cx.notify();
+    })
+    .detach();
 }
 
-fn handle_event(
-    event: iced::Event,
-    _status: iced::event::Status,
-    _id: iced::window::Id,
-) -> Option<Message> {
-    use iced::keyboard::{key::Named, Event::KeyPressed, Key};
-
-    match event {
-        iced::Event::Keyboard(KeyPressed {
-            key: Key::Named(Named::Escape),
-            ..
-        }) => Some(Message::Cancel),
-        iced::Event::Keyboard(KeyPressed {
-            key: Key::Named(Named::Enter),
-            ..
-        }) => Some(Message::Confirm),
-        iced::Event::Keyboard(KeyPressed {
-            key: Key::Named(Named::Tab),
-            modifiers,
-            ..
-        }) => Some(if modifiers.shift() {
-            Message::FocusPrevious
-        } else {
-            Message::FocusNext
-        }),
-        _ => None,
-    }
-}
-
-fn update(state: &mut State, message: Message) -> Task<Message> {
-    if state.done {
-        return Task::none();
-    }
-    match message {
-        Message::PinChanged(value) => {
-            state.pin = Zeroizing::new(value);
-            state.mismatch = false;
-            Task::none()
-        }
-        Message::RepeatChanged(value) => {
-            state.repeat = Zeroizing::new(value);
-            state.mismatch = false;
-            Task::none()
-        }
-        Message::Reveal(reveal) => {
-            state.reveal = reveal;
-            Task::none()
-        }
-        Message::Confirm => match state.config.kind {
-            DialogKind::Pin => {
-                if state.config.repeat_label.is_some() && *state.pin != *state.repeat {
-                    state.mismatch = true;
-                    Task::none()
+impl Dialog {
+    fn new(cx: &mut Context<Self>, config: DialogConfig, result: Arc<Mutex<DialogResult>>) -> Self {
+        let (pin, repeat) = if let DialogKind::Pin = config.kind {
+            let pad = px(20.0 + 16.0);
+            let pin = cx.new(|cx| Field::new(cx, true, config.placeholder.clone(), pad));
+            subscribe_field(cx, &pin);
+            let repeat = config.repeat_label.as_ref().map(|label| {
+                let placeholder = if label.is_empty() {
+                    "Confirm PIN".to_string()
                 } else {
-                    let pin = std::mem::replace(&mut state.pin, Zeroizing::new(String::new()));
-                    let choice = state.choice;
-                    state.finish(DialogResult::Pin {
-                        secret: pin,
-                        choice,
-                    })
+                    label.clone()
+                };
+                let repeat = cx.new(|cx| Field::new(cx, true, placeholder, px(0.)));
+                subscribe_field(cx, &repeat);
+                repeat
+            });
+            (Some(pin), repeat)
+        } else {
+            (None, None)
+        };
+
+        Self {
+            choice: config.choice,
+            config,
+            pin,
+            repeat,
+            focus: cx.focus_handle(),
+            reveal: false,
+            mismatch: false,
+            fade: Fade::default(),
+            result,
+        }
+    }
+
+    fn initial_focus(&self, cx: &App) -> FocusHandle {
+        match &self.pin {
+            Some(pin) => pin.read(cx).focus_handle(),
+            None => self.focus.clone(),
+        }
+    }
+
+    fn focus_handles(&self, cx: &App) -> Vec<FocusHandle> {
+        let mut handles = Vec::new();
+        if let Some(pin) = &self.pin {
+            handles.push(pin.read(cx).focus_handle());
+        }
+        if let Some(repeat) = &self.repeat {
+            handles.push(repeat.read(cx).focus_handle());
+        }
+        handles
+    }
+
+    fn step_focus(&mut self, delta: isize, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let handles = self.focus_handles(cx);
+        if handles.is_empty() {
+            return;
+        }
+        let current = handles.iter().position(|h| h.is_focused(window));
+        let next = match current {
+            Some(i) => (i as isize + delta).rem_euclid(handles.len() as isize) as usize,
+            None => 0,
+        };
+        window.focus(&handles[next]);
+        cx.notify();
+    }
+
+    fn set_reveal(&mut self, reveal: bool, cx: &mut Context<Self>) {
+        if self.reveal == reveal {
+            return;
+        }
+        self.reveal = reveal;
+        for handle in [&self.pin, &self.repeat].into_iter().flatten() {
+            handle.update(cx, |field, _| field.set_masked(!reveal));
+        }
+        cx.notify();
+    }
+
+    fn finish(&self, result: DialogResult, cx: &mut Context<Self>) {
+        *self.result.lock().unwrap() = result;
+        cx.quit();
+    }
+
+    fn submit(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
+        match self.config.kind {
+            DialogKind::Pin => {
+                let pin = self.pin.as_ref().unwrap();
+                if let Some(repeat) = &self.repeat {
+                    let matches = pin.read(cx).value() == repeat.read(cx).value();
+                    if !matches {
+                        self.mismatch = true;
+                        cx.notify();
+                        return;
+                    }
                 }
+                let secret = pin.update(cx, |field, _| field.take_value());
+                if let Some(repeat) = &self.repeat {
+                    repeat.update(cx, |field, _| {
+                        field.take_value();
+                    });
+                }
+                let choice = self.choice;
+                self.finish(DialogResult::Pin { secret, choice }, cx);
             }
             DialogKind::Confirm { .. } | DialogKind::Message => {
-                let choice = state.choice;
-                state.finish(DialogResult::Confirmed { choice })
+                let choice = self.choice;
+                self.finish(DialogResult::Confirmed { choice }, cx);
             }
-        },
-        Message::ToggleChoice(value) => {
-            state.choice = value;
-            Task::none()
-        }
-        Message::Decline => state.finish(DialogResult::Declined),
-        Message::Cancel => state.finish(DialogResult::Cancelled),
-        Message::FocusNext => iced::widget::operation::focus_next(),
-        Message::FocusPrevious => iced::widget::operation::focus_previous(),
-        Message::Tick => {
-            let started = *state.started.get_or_insert_with(Instant::now);
-            let t = (started.elapsed().as_secs_f32() / FADE_IN).clamp(0.0, 1.0);
-            state.opacity = 1.0 - (1.0 - t) * (1.0 - t);
-            Task::none()
-        }
-        _ => Task::none(),
-    }
-}
-
-fn view(state: &State) -> Element<'_, Message> {
-    let config = &state.config;
-    let window = &theme().window;
-    let spacing = window.spacing;
-    let mut card = column![header(config, state.opacity < 1.0)].width(Length::Fill);
-
-    if let Some(info) = info_block(config) {
-        card = gap(card, spacing).push(info);
-    }
-    if let Some(error) = &config.error {
-        card = gap(card, spacing).push(banner(error));
-    }
-
-    if let DialogKind::Pin = config.kind {
-        card = gap(card, spacing).push(pin_section(state));
-    }
-
-    if let Some(label) = &config.choice_label {
-        if !matches!(config.kind, DialogKind::Message) {
-            card = gap(card, spacing).push(choice_row(label, state.choice));
         }
     }
 
-    card = gap(card, spacing).push(footer(state));
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.finish(DialogResult::Cancelled, cx);
+    }
 
-    let card = container(card)
-        .padding(edges(window.padding))
-        .max_width(window.width)
-        .width(Length::Fill)
-        .style(card_style);
-
-    container(card).center(Length::Fill).padding(64).into()
-}
-
-pub(crate) fn edges(padding: theme::Padding) -> iced::Padding {
-    iced::Padding {
-        top: padding.y,
-        bottom: padding.y,
-        left: padding.x,
-        right: padding.x,
+    fn decline(&mut self, cx: &mut Context<Self>) {
+        self.finish(DialogResult::Declined, cx);
     }
 }
 
-fn gap(card: Column<'_, Message>, height: f32) -> Column<'_, Message> {
-    card.push(Space::new().height(Length::Fixed(height)))
+impl Render for Dialog {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = self.fade.opacity(window);
+
+        let mut body: Vec<AnyElement> = vec![header(&self.config.heading).into_any_element()];
+        if let Some(info) = self
+            .config
+            .description
+            .as_deref()
+            .and_then(|d| info_block(d.lines()))
+        {
+            body.push(info);
+        }
+        if let Some(error) = &self.config.error {
+            body.push(banner(error).into_any_element());
+        }
+        if let DialogKind::Pin = self.config.kind {
+            body.push(self.pin_section(cx));
+        }
+        if let Some(label) = &self.config.choice_label {
+            if !matches!(self.config.kind, DialogKind::Message) {
+                body.push(self.choice_row(label, cx));
+            }
+        }
+        body.push(self.footer(cx));
+
+        backdrop()
+            .track_focus(&self.focus)
+            .key_context("Dialog")
+            .on_action(cx.listener(|this, _: &Submit, window, cx| this.submit(window, cx)))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
+            .on_action(
+                cx.listener(|this, _: &FocusNext, window, cx| this.step_focus(1, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FocusPrevious, window, cx| this.step_focus(-1, window, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.set_reveal(false, cx)),
+            )
+            .opacity(opacity)
+            .child(card(body))
+    }
 }
 
-fn choice_row(label: &str, checked: bool) -> Element<'_, Message> {
-    let base = &theme().checkbox;
-    checkbox(checked)
-        .label(label.to_string())
-        .on_toggle(Message::ToggleChoice)
-        .size(base.box_size)
-        .text_size(base.font.size)
-        .spacing(base.spacing)
-        .style(|_theme, status| {
-            let is_checked = matches!(
-                status,
-                checkbox::Status::Active { is_checked: true }
-                    | checkbox::Status::Hovered { is_checked: true }
-                    | checkbox::Status::Disabled { is_checked: true }
+impl Dialog {
+    fn pin_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let config = &self.config;
+        let pin = self.pin.clone().unwrap();
+        let reveal = &theme().reveal.base;
+
+        let eye = div()
+            .id("reveal")
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .right(px(13.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.set_reveal(true, cx)),
+            )
+            .child(
+                svg()
+                    .path(if self.reveal {
+                        "eye-off.svg"
+                    } else {
+                        "eye.svg"
+                    })
+                    .size(px(reveal.size))
+                    .text_color(reveal.text),
             );
-            let t = if is_checked {
-                &theme().checkbox_checked
-            } else {
-                &theme().checkbox.paint
-            };
-            checkbox::Style {
-                background: Background::Color(t.background),
-                icon_color: t.check,
-                border: Border {
-                    color: t.border.color,
-                    width: t.border.size,
-                    radius: t.radius.into(),
-                },
-                text_color: Some(t.color),
-            }
-        })
-        .into()
-}
 
-fn header(config: &DialogConfig, animating: bool) -> Element<'_, Message> {
-    let ti = &theme().title_icon;
-    let tile = ti.size + ti.padding * 2.0;
-    let ticker = canvas_widget(Ticker { animating })
-        .width(Length::Fixed(tile))
-        .height(Length::Fixed(tile));
-    let glyph = container(
-        svg(lock_icon())
-            .width(Length::Fixed(ti.size))
-            .height(Length::Fixed(ti.size))
-            .style(|_theme, _status| svg::Style {
-                color: Some(theme().title_icon.color),
-            }),
-    )
-    .center(Length::Fixed(tile));
-    let icon = container(stack![ticker, glyph]).style(icon_style);
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(div().relative().w_full().child(pin).child(eye));
 
-    row![
-        icon,
-        text(config.heading.clone())
-            .size(theme().title.font.size)
-            .font(theme().title.font.family)
-            .color(theme().title.color)
-    ]
-    .spacing(14)
-    .align_y(iced::Alignment::Center)
-    .into()
-}
-
-fn info_block(config: &DialogConfig) -> Option<Element<'_, Message>> {
-    let description = config.description.as_ref()?;
-
-    let mut block = column![].spacing(6);
-    let mut any = false;
-    for line in description.lines().filter(|l| !l.trim().is_empty()) {
-        any = true;
-        block = block.push(info_line(line.trim()));
-    }
-
-    any.then(|| block.into())
-}
-
-fn info_line(line: &str) -> Element<'_, Message> {
-    let label = &theme().description.label;
-    let value = &theme().description.value;
-    if let Some((name, text_value)) = line.split_once(": ") {
-        if !name.is_empty() && name.len() <= 24 && !text_value.trim().is_empty() {
-            return row![
-                text(format!("{name}:"))
-                    .size(label.font.size)
-                    .font(label.font.family)
-                    .color(label.color),
-                text(text_value.trim().to_string())
-                    .size(value.font.size)
-                    .font(value.font.family)
-                    .color(value.color)
-                    .width(Length::Fill),
-            ]
-            .spacing(8)
-            .into();
+        if config.quality_bar {
+            section = section.child(strength_bar(
+                self.pin.as_ref().unwrap().read(cx).char_count(),
+            ));
         }
-    }
-    text(line.to_string())
-        .size(value.font.size)
-        .font(value.font.family)
-        .color(value.color)
-        .width(Length::Fill)
-        .into()
-}
 
-fn pin_section(state: &State) -> Element<'_, Message> {
-    let config = &state.config;
-    let mut section = column![pin_field(
-        Some(PIN_ID.clone()),
-        &config.placeholder,
-        &state.pin,
-        state.reveal,
-        Message::PinChanged,
-        true,
-    )]
-    .spacing(12);
+        if let Some(repeat) = &self.repeat {
+            section = section.child(repeat.clone());
+            if self.mismatch {
+                let msg = if config.repeat_error.is_empty() {
+                    "The PINs do not match."
+                } else {
+                    config.repeat_error.as_str()
+                };
+                let error = &theme().error.base;
+                section = section.child(
+                    div()
+                        .text_size(px(error.size))
+                        .text_color(error.text)
+                        .child(msg.to_string()),
+                );
+            }
+        }
 
-    if config.quality_bar {
-        let value = strength(&state.pin);
-        let fill = strength_color(value);
-        section = section.push(
-            progress_bar(0.0..=1.0, value)
-                .girth(Length::Fixed(theme().strength.height))
-                .style(move |_theme| {
-                    let t = &theme().strength;
-                    progress_bar::Style {
-                        background: Background::Color(t.track),
-                        bar: Background::Color(fill),
-                        border: Border {
-                            color: t.border.color,
-                            width: t.border.size,
-                            radius: t.radius.into(),
-                        },
-                    }
-                }),
-        );
+        section.into_any_element()
     }
 
-    if let Some(repeat_label) = &config.repeat_label {
-        let placeholder = if repeat_label.is_empty() {
-            "Confirm PIN"
+    fn choice_row(&self, label: &str, cx: &mut Context<Self>) -> AnyElement {
+        let checkbox = &theme().checkbox;
+        let style = if self.choice {
+            &checkbox.checked
         } else {
-            repeat_label.as_str()
+            &checkbox.base
         };
-        section = section.push(pin_field(
-            None,
-            placeholder,
-            &state.repeat,
-            state.reveal,
-            Message::RepeatChanged,
-            false,
-        ));
-        if state.mismatch {
-            let msg = if config.repeat_error.is_empty() {
-                "The PINs do not match."
-            } else {
-                config.repeat_error.as_str()
-            };
-            section = section.push(
-                text(msg.to_string())
-                    .size(theme().error.font.size)
-                    .color(theme().error.color),
-            );
+        let mut boxd = apply(
+            div().size(px(style.size)).flex().items_center().justify_center(),
+            style,
+        );
+        if self.choice {
+            boxd = boxd.child(div().text_size(px(style.size - 4.0)).child("\u{2713}"));
         }
+
+        div()
+            .id("choice")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(style.text)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.choice = !this.choice;
+                cx.notify();
+            }))
+            .child(boxd)
+            .child(label.to_string())
+            .into_any_element()
     }
 
-    section.into()
+    fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let config = &self.config;
+        let dismissible = !matches!(config.kind, DialogKind::Message);
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .child(hints(config.kind))
+            .child(div().flex_1());
+
+        if dismissible {
+            if let DialogKind::Confirm { one_button: false } | DialogKind::Pin = config.kind {
+                row = row.child(
+                    button("cancel", config.cancel_label.clone(), &theme().cancel)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                );
+            }
+        }
+
+        if let DialogKind::Confirm { one_button: false } = config.kind {
+            if let Some(not_ok) = &config.not_ok_label {
+                row = row.child(
+                    button("decline", not_ok.clone(), &theme().cancel)
+                        .on_click(cx.listener(|this, _, _, cx| this.decline(cx))),
+                );
+            }
+        }
+
+        row = row.child(
+            button("confirm", config.ok_label.clone(), &theme().confirm)
+                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+        );
+
+        row.gap(px(10.)).into_any_element()
+    }
 }
 
-fn pin_field<'a>(
-    id: Option<iced::widget::Id>,
-    placeholder: &str,
-    value: &str,
-    reveal: bool,
-    on_input: impl Fn(String) -> Message + 'a,
-    with_toggle: bool,
-) -> Element<'a, Message> {
-    let field = &theme().field;
-    let padding = iced::Padding {
-        top: field.padding.y,
-        bottom: field.padding.y,
-        left: field.padding.x,
-        right: if with_toggle {
-            field.padding.x + theme().reveal.size + 16.0
-        } else {
-            field.padding.x
-        },
-    };
-    let mut input = text_input(placeholder, value)
-        .secure(!reveal)
-        .on_input(on_input)
-        .font(field.font.family)
-        .size(field.font.size)
-        .padding(padding)
-        .width(Length::Fill)
-        .style(field_input);
-    if let Some(id) = id {
-        input = input.id(id);
-    }
-
-    if !with_toggle {
-        return input.into();
-    }
-
-    let eye = mouse_area(
-        svg(eye_icon(reveal))
-            .width(Length::Fixed(theme().reveal.size))
-            .height(Length::Fixed(theme().reveal.size))
-            .style(|_theme, _status| svg::Style {
-                color: Some(theme().reveal.color),
-            }),
-    )
-    .on_press(Message::Reveal(true))
-    .on_release(Message::Reveal(false))
-    .on_exit(Message::Reveal(false));
-    let reveal_control = container(eye)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(iced::alignment::Horizontal::Right)
-        .align_y(iced::alignment::Vertical::Center)
-        .padding(iced::Padding {
-            top: 0.0,
-            right: 13.0,
-            bottom: 0.0,
-            left: 0.0,
-        });
-
-    stack![input, reveal_control].into()
-}
-
-fn footer(state: &State) -> Element<'_, Message> {
-    let config = &state.config;
-    let mut row = row![hints(config)]
-        .spacing(10)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill);
-    row = row.push(Space::new().width(Length::Fill));
-
-    let dismissible = !matches!(config.kind, DialogKind::Message);
-    if dismissible {
-        if let DialogKind::Confirm { one_button: false } | DialogKind::Pin = config.kind {
-            row = row.push(
-                button(text(config.cancel_label.clone()).size(theme().cancel.font.size))
-                    .on_press(Message::Cancel)
-                    .padding(edges(theme().cancel.padding))
-                    .style(text_button),
-            );
-        }
-    }
-
-    if let DialogKind::Confirm { one_button: false } = config.kind {
-        if let Some(not_ok) = &config.not_ok_label {
-            row = row.push(
-                button(text(not_ok.clone()).size(theme().cancel.font.size))
-                    .on_press(Message::Decline)
-                    .padding(edges(theme().cancel.padding))
-                    .style(text_button),
-            );
-        }
-    }
-
-    row.push(
-        button(text(config.ok_label.clone()).size(theme().confirm.font.size))
-            .on_press(Message::Confirm)
-            .padding(edges(theme().confirm.padding))
-            .style(pill_button),
-    )
-    .into()
-}
-
-fn hints(config: &DialogConfig) -> Element<'_, Message> {
-    let items: &[(&str, &str)] = match config.kind {
+fn hints(kind: DialogKind) -> Div {
+    let items: &[(&str, &str)] = match kind {
         DialogKind::Pin => &[("\u{21B5}", "unlock"), ("Esc", "cancel")],
         DialogKind::Confirm { one_button: false } => &[("\u{21B5}", "confirm"), ("esc", "cancel")],
         DialogKind::Confirm { one_button: true } | DialogKind::Message => {
             &[("\u{21B5}", "dismiss")]
         }
     };
-
-    let key = &theme().hint.key;
-    let word = &theme().hint.word;
-    let mut line = row![]
-        .spacing(theme().hint.spacing)
-        .align_y(iced::Alignment::Center);
-    for (i, (glyph, label)) in items.iter().enumerate() {
-        if i > 0 {
-            line = line.push(text("\u{00B7}").size(word.font.size).color(word.color));
-        }
-        line = line.push(
-            text(*glyph)
-                .font(key.font.family)
-                .size(key.font.size)
-                .color(key.color),
-        );
-        line = line.push(
-            text(*label)
-                .font(word.font.family)
-                .size(word.font.size)
-                .color(word.color),
-        );
-    }
-    line.into()
+    hint_line(items)
 }
 
-fn banner<'a>(message: &str) -> Element<'a, Message> {
-    container(
-        text(message.to_string())
-            .size(theme().error.font.size)
-            .color(theme().error.color),
-    )
-    .padding(edges(theme().error.padding))
-    .width(Length::Fill)
-    .style(|_theme| {
-        let t = &theme().error;
-        container::Style {
-            background: Some(Background::Color(t.background)),
-            border: Border {
-                color: t.border.color,
-                width: t.border.size,
-                radius: t.radius.into(),
-            },
-            ..Default::default()
-        }
+fn bind_dialog_keys(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("enter", Submit, Some("Dialog")),
+        gpui::KeyBinding::new("escape", Cancel, Some("Dialog")),
+        gpui::KeyBinding::new("tab", FocusNext, Some("Dialog")),
+        gpui::KeyBinding::new("shift-tab", FocusPrevious, Some("Dialog")),
+    ]);
+}
+
+fn open_dialog_window(cx: &mut App, config: DialogConfig, result: Arc<Mutex<DialogResult>>) {
+    cx.open_window(layer_window(), |window, cx| {
+        let dialog = cx.new(|cx| Dialog::new(cx, config, result));
+        let handle = dialog.read(cx).initial_focus(cx);
+        window.focus(&handle);
+        dialog
     })
-    .into()
+    .unwrap();
 }
 
-struct Ticker {
-    animating: bool,
+fn take_result(result: &Arc<Mutex<DialogResult>>) -> DialogResult {
+    let mut slot = result.lock().unwrap();
+    std::mem::replace(&mut slot, DialogResult::Cancelled)
 }
 
-impl Program<Message> for Ticker {
-    type State = ();
+pub fn run_dialog(config: DialogConfig) -> DialogResult {
+    let result = Arc::new(Mutex::new(DialogResult::Cancelled));
+    let done = cancelable_watchdog("dialog");
 
-    fn update(
-        &self,
-        _state: &mut (),
-        event: &iced::Event,
-        _bounds: iced::Rectangle,
-        _cursor: iced::mouse::Cursor,
-    ) -> Option<Action<Message>> {
-        let is_frame = matches!(
-            event,
-            iced::Event::Window(iced::window::Event::RedrawRequested(_))
-        );
-        (self.animating && is_frame).then(|| Action::publish(Message::Tick))
-    }
+    let app_result = result.clone();
+    Application::new()
+        .with_assets(Icons)
+        .run(move |cx: &mut App| {
+            bind_dialog_keys(cx);
+            open_dialog_window(cx, config.clone(), app_result.clone());
+        });
 
-    fn draw(
-        &self,
-        _state: &(),
-        _renderer: &iced::Renderer,
-        _theme: &Theme,
-        _bounds: iced::Rectangle,
-        _cursor: iced::mouse::Cursor,
-    ) -> Vec<Geometry> {
-        Vec::new()
-    }
+    let _ = done.send(());
+    take_result(&result)
 }
 
-fn style(state: &State, _theme: &Theme) -> iced::theme::Style {
-    let backdrop = theme().backdrop.color;
-    iced::theme::Style {
-        background_color: Color {
-            a: backdrop.a * state.opacity,
-            ..backdrop
-        },
-        text_color: theme().title.color,
-    }
-}
+pub fn run_dialog_stdio() -> DialogResult {
+    let result = Arc::new(Mutex::new(DialogResult::Cancelled));
 
-pub(crate) fn card_style(_theme: &Theme) -> container::Style {
-    let t = &theme().window;
-    container::Style {
-        text_color: Some(theme().title.color),
-        background: Some(Background::Color(t.background)),
-        border: Border {
-            color: t.border.color,
-            width: t.border.size,
-            radius: t.radius.into(),
-        },
-        shadow: Shadow {
-            color: t.shadow.color,
-            offset: Vector::new(0.0, t.shadow.offset),
-            blur_radius: t.shadow.blur,
-        },
-        ..Default::default()
-    }
-}
+    let app_result = result.clone();
+    Application::new()
+        .with_assets(Icons)
+        .run(move |cx: &mut App| {
+            bind_dialog_keys(cx);
 
-pub(crate) fn icon_style(_theme: &Theme) -> container::Style {
-    let t = &theme().title_icon;
-    container::Style {
-        background: Some(Background::Color(t.background)),
-        border: Border {
-            color: t.border.color,
-            width: t.border.size,
-            radius: t.radius.into(),
-        },
-        ..Default::default()
-    }
-}
+            let (tx, rx) = std::sync::mpsc::channel::<Option<DialogConfig>>();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let config = match std::io::stdin().read_line(&mut line) {
+                    Ok(n) if n > 0 => serde_json::from_str::<DialogConfig>(line.trim()).ok(),
+                    _ => None,
+                };
+                let _ = tx.send(config);
+            });
 
-pub(crate) fn field_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let t = match status {
-        text_input::Status::Focused { .. } => &theme().field_focus,
-        _ => &theme().field.paint,
-    };
-    text_input::Style {
-        background: Background::Color(t.background),
-        border: Border {
-            color: t.border.color,
-            width: t.border.size,
-            radius: t.radius.into(),
-        },
-        icon: Color::TRANSPARENT,
-        placeholder: t.placeholder,
-        value: t.color,
-        selection: t.selection,
-    }
-}
+            let app_result = app_result.clone();
+            cx.spawn(async move |cx| loop {
+                match rx.try_recv() {
+                    Ok(Some(config)) => {
+                        let _ = cx.update(|cx| {
+                            arm_watchdog("dialog");
+                            open_dialog_window(cx, config, app_result.clone());
+                        });
+                        break;
+                    }
+                    Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(20))
+                            .await;
+                    }
+                }
+            })
+            .detach();
+        });
 
-pub(crate) fn pill_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let t = match status {
-        button::Status::Hovered | button::Status::Pressed => &theme().confirm_hover,
-        _ => &theme().confirm.paint,
-    };
-    button_style(t)
-}
-
-pub(crate) fn text_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let t = match status {
-        button::Status::Hovered | button::Status::Pressed => &theme().cancel_hover,
-        _ => &theme().cancel.paint,
-    };
-    button_style(t)
-}
-
-fn button_style(t: &theme::ButtonPaint) -> button::Style {
-    button::Style {
-        background: Some(Background::Color(t.background)),
-        text_color: t.color,
-        border: Border {
-            color: t.border.color,
-            width: t.border.size,
-            radius: t.radius.into(),
-        },
-        ..Default::default()
-    }
-}
-
-fn strength(pin: &str) -> f32 {
-    (pin.chars().count() as f32 / 20.0).clamp(0.0, 1.0)
-}
-
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    Color::from_rgb(
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-    )
-}
-
-fn strength_color(value: f32) -> Color {
-    let t = &theme().strength;
-    if value < 0.5 {
-        lerp_color(t.weak, t.medium, value / 0.5)
-    } else {
-        lerp_color(t.medium, t.strong, (value - 0.5) / 0.5)
-    }
+    take_result(&result)
 }

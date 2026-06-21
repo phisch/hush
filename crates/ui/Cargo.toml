@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 theme = { path = "../theme" }
-# wgpu renders translucency correctly; tiny-skia is the software fallback and needs "wayland" for softbuffer.
-iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "thread-pool", "wayland", "canvas", "svg"] }
-iced_layershell = { version = "0.18", default-features = false }
+gpui = { package = "gpui-ce", version = "0.3.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = "1"
