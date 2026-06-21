@@ -17,7 +17,7 @@ pub fn run<P: Prompter>(ui: P) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve(ui: Arc<dyn Prompter>) -> Result<(), Box<dyn std::error::Error>> {
-    let service = prompter::Service::new(ui);
+    let service = prompter::Service::new(ui, tokio::runtime::Handle::current());
     let shared = service.shared();
 
     let connection = Builder::session()?

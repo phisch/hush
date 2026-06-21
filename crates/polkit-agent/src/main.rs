@@ -20,6 +20,7 @@ const OBJECT_PATH: &str = "/org/psst/PolicyKit1/AuthenticationAgent";
 struct Agent {
     cancels: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     handle: tokio::runtime::Handle,
+    warm: Arc<Mutex<Option<Child>>>,
 }
 
 fn main() {
@@ -39,6 +40,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent {
         cancels: Arc::new(Mutex::new(HashMap::new())),
         handle: tokio::runtime::Handle::current(),
+        warm: Arc::new(Mutex::new(spawn_dialog().ok())),
     };
     let _connection =
         polkit_agent_instance(move || agent.clone(), authenticate, cancel_authentication)
@@ -73,7 +75,12 @@ async fn authenticate(
 
     let authenticated = agent
         .handle
-        .spawn(converse(session, message.to_owned(), cancel))
+        .spawn(converse(
+            agent.warm.clone(),
+            session,
+            message.to_owned(),
+            cancel,
+        ))
         .await
         .unwrap_or(None);
 
@@ -94,11 +101,12 @@ async fn cancel_authentication(agent: &mut Agent, cookie: &str) -> Result<(), Er
 }
 
 async fn converse(
+    warm: Arc<Mutex<Option<Child>>>,
     session: PolkitAgentSession,
     message: String,
     cancel: Arc<Notify>,
 ) -> Option<bool> {
-    let mut child = spawn_dialog().ok()?;
+    let mut child = take_warm(&warm)?;
     let mut stdin = child.stdin.take()?;
     let mut lines = BufReader::new(child.stdout.take()?).lines();
 
@@ -113,7 +121,19 @@ async fn converse(
     };
 
     kill(&mut child).await;
+    *warm.lock().unwrap() = spawn_dialog().ok();
     outcome
+}
+
+fn take_warm(warm: &Mutex<Option<Child>>) -> Option<Child> {
+    let taken = warm.lock().unwrap().take();
+    if let Some(mut child) = taken {
+        if matches!(child.try_wait(), Ok(None)) {
+            return Some(child);
+        }
+        let _ = child.start_kill();
+    }
+    spawn_dialog().ok()
 }
 
 async fn drive(

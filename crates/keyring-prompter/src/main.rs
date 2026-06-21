@@ -1,10 +1,11 @@
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::prelude::*;
 use keyring_prompter::{Cancel, PromptKind, PromptRequest, PromptResponse, Prompter};
-use ui::{run_dialog, DialogConfig, DialogKind, DialogResult};
+use ui::{run_dialog_stdio, DialogConfig, DialogKind, DialogResult};
 use zeroize::Zeroizing;
 
 const DIALOG_FLAG: &str = "--dialog";
@@ -18,23 +19,15 @@ fn main() {
         return;
     }
     hardening::forbid_dumps();
-    if let Err(error) = keyring_prompter::run(SubprocessPrompter) {
+    if let Err(error) = keyring_prompter::run(SubprocessPrompter::new()) {
         eprintln!("psst-keyring: {error}");
         std::process::exit(1);
     }
 }
 
 fn run_dialog_child() {
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        std::process::exit(1);
-    }
-    let Ok(config) = serde_json::from_str::<DialogConfig>(&input) else {
-        std::process::exit(1);
-    };
-
     let mut out = std::io::stdout().lock();
-    match run_dialog(config) {
+    match run_dialog_stdio() {
         DialogResult::Pin { secret, choice } => {
             let encoded = Zeroizing::new(BASE64_STANDARD.encode(secret.as_bytes()));
             let _ = writeln!(out, "pin {} {}", *encoded, choice as u8);
@@ -48,48 +41,87 @@ fn run_dialog_child() {
     }
 }
 
-struct SubprocessPrompter;
+struct SubprocessPrompter {
+    warm: Mutex<Option<Child>>,
+}
+
+impl SubprocessPrompter {
+    fn new() -> Self {
+        let prompter = SubprocessPrompter {
+            warm: Mutex::new(None),
+        };
+        prompter.prewarm();
+        prompter
+    }
+
+    fn prewarm(&self) {
+        *self.warm.lock().unwrap() = spawn_dialog_child();
+    }
+
+    fn take_warm(&self) -> Option<Child> {
+        self.warm.lock().unwrap().take().or_else(spawn_dialog_child)
+    }
+}
 
 impl Prompter for SubprocessPrompter {
     fn prompt(&self, request: PromptRequest, cancel: &Cancel) -> PromptResponse {
         let Ok(json) = serde_json::to_string(&dialog_config(&request)) else {
             return PromptResponse::Dismissed;
         };
-        show(json, cancel).unwrap_or(PromptResponse::Dismissed)
+        let response = self.show(json, cancel).unwrap_or(PromptResponse::Dismissed);
+        self.prewarm();
+        response
     }
 }
 
-fn show(config_json: String, cancel: &Cancel) -> Option<PromptResponse> {
+impl SubprocessPrompter {
+    fn show(&self, config_json: String, cancel: &Cancel) -> Option<PromptResponse> {
+        let line = format!("{config_json}\n");
+        let mut child = self.take_warm()?;
+        if !send_config(&mut child, &line) {
+            let _ = child.kill();
+            let _ = child.wait();
+            child = spawn_dialog_child()?;
+            if !send_config(&mut child, &line) {
+                return Some(PromptResponse::Dismissed);
+            }
+        }
+
+        let started = Instant::now();
+        loop {
+            if cancel.is_cancelled() || started.elapsed() > CHILD_KILL_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(PromptResponse::Dismissed);
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(POLL),
+                Err(_) => return Some(PromptResponse::Dismissed),
+            }
+        }
+
+        let mut output = Zeroizing::new(String::new());
+        child.stdout.take()?.read_to_string(&mut output).ok()?;
+        Some(parse_response(&output))
+    }
+}
+
+fn spawn_dialog_child() -> Option<Child> {
     let exe = std::env::current_exe().ok()?;
-    let mut child = Command::new(exe)
+    Command::new(exe)
         .arg(DIALOG_FLAG)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .ok()?;
+        .ok()
+}
 
-    {
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(config_json.as_bytes()).ok()?;
+fn send_config(child: &mut Child, line: &str) -> bool {
+    match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(line.as_bytes()).is_ok() && stdin.flush().is_ok(),
+        None => false,
     }
-
-    let started = Instant::now();
-    loop {
-        if cancel.is_cancelled() || started.elapsed() > CHILD_KILL_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Some(PromptResponse::Dismissed);
-        }
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(POLL),
-            Err(_) => return Some(PromptResponse::Dismissed),
-        }
-    }
-
-    let mut output = Zeroizing::new(String::new());
-    child.stdout.take()?.read_to_string(&mut output).ok()?;
-    Some(parse_response(&output))
 }
 
 fn parse_response(output: &str) -> PromptResponse {

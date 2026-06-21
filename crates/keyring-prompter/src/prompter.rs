@@ -56,14 +56,16 @@ pub struct Service {
     ui: Arc<dyn Ui>,
     shared: Arc<Shared>,
     dialog_slot: Arc<Semaphore>,
+    handle: tokio::runtime::Handle,
 }
 
 impl Service {
-    pub fn new(ui: Arc<dyn Ui>) -> Self {
+    pub fn new(ui: Arc<dyn Ui>, handle: tokio::runtime::Handle) -> Self {
         Service {
             ui,
             shared: Arc::new(Shared::new()),
             dialog_slot: Arc::new(Semaphore::new(1)),
+            handle,
         }
     }
 
@@ -106,7 +108,7 @@ impl Service {
         };
 
         let connection = connection.clone();
-        tokio::spawn(async move {
+        self.handle.spawn(async move {
             prompt_ready(&connection, &key, "", &message, HashMap::new()).await;
         });
         Ok(())
@@ -171,7 +173,7 @@ impl Service {
         let slot = self.dialog_slot.clone();
         let connection = connection.clone();
         let prompt_cancel = cancel.clone();
-        tokio::spawn(async move {
+        self.handle.spawn(async move {
             let Ok(_permit) = slot.acquire().await else {
                 shared.active.lock().unwrap().remove(&key);
                 return;
@@ -232,7 +234,7 @@ impl Service {
         cancel.trigger();
 
         let connection = connection.clone();
-        tokio::spawn(async move {
+        self.handle.spawn(async move {
             prompt_done(&connection, &key).await;
         });
     }
