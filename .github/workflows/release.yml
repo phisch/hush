@@ -22,7 +22,8 @@ jobs:
             pkg-config \
             libwayland-dev \
             libxkbcommon-dev \
-            libfontconfig1-dev
+            libfontconfig1-dev \
+            libsystemd-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
