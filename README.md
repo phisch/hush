@@ -64,5 +64,10 @@ The [`default-theme.kdl`](crates/theme/src/default-theme.kdl) file is the defaul
 
 ## License
 
-[MPL-2.0](LICENSE). You can use psst in anything, but if you redistribute the
-covered files (modified or not), their source must stay open under the MPL.
+psst is licensed per binary:
+
+- **`psst-pinentry`** and **`psst-keyring-prompter`** — [MPL-2.0](LICENSE). Use
+  them in anything; if you redistribute the covered files (modified or not),
+  their source must stay open under the MPL.
+- **`psst-polkit-agent`** — [GPL-3.0-or-later](LICENSE-GPL-3.0). It statically
+  links the GPL-licensed `zbus-polkit-agent`, so the combined binary is GPL.

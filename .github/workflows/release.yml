@@ -47,7 +47,7 @@ jobs:
         run: |
           name="psst-${GITHUB_REF_NAME}-x86_64-linux"
           mkdir "$name"
-          cp target/release/psst-pinentry target/release/psst-keyring-prompter target/release/psst-polkit-agent README.md "$name"/
+          cp target/release/psst-pinentry target/release/psst-keyring-prompter target/release/psst-polkit-agent README.md LICENSE LICENSE-GPL-3.0 "$name"/
           strip "$name"/psst-pinentry "$name"/psst-keyring-prompter "$name"/psst-polkit-agent
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
